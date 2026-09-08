@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+test_output.json
+resume.txt
+.pytest_cache/
+.mypy_cache/
+web/node_modules/
+web/.next/
+web/.env.local
+.tools/

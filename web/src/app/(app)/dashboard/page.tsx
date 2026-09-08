@@ -1,0 +1,177 @@
+import Link from "next/link";
+import { createClient } from "@/lib/supabase/server";
+import { PageHeader, RunSearchButton } from "@/components/layout/sidebar";
+import { Card, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import {
+  activeResumeName,
+  formatCurrency,
+  preferencesSalaryLabel,
+  profileCompletionPercent,
+} from "@/lib/utils/dashboard";
+import { formatWorkLocationLine } from "@/lib/jobs/format";
+import type { CandidateProfile, JobListing, JobPreferences, Project, Resume } from "@/lib/types/database";
+
+async function loadDashboardData(userId: string) {
+  const supabase = await createClient();
+
+  const [profileRes, resumesRes, projectsRes, prefsRes, jobsRes] = await Promise.all([
+    supabase.from("candidate_profiles").select("*").eq("user_id", userId).maybeSingle(),
+    supabase.from("resumes").select("*").eq("user_id", userId).order("updated_at", { ascending: false }),
+    supabase.from("projects").select("*").eq("user_id", userId),
+    supabase.from("job_preferences").select("*").eq("user_id", userId).maybeSingle(),
+    supabase
+      .from("jobs")
+      .select("id, title, company, location, description, job_url, match_score, fit_reason, status, last_seen_at")
+      .order("match_score", { ascending: false, nullsFirst: false })
+      .limit(5),
+  ]);
+
+  return {
+    profile: (profileRes.data as CandidateProfile | null) ?? null,
+    resumes: (resumesRes.data as Resume[]) ?? [],
+    projects: (projectsRes.data as Project[]) ?? [],
+    preferences: (prefsRes.data as JobPreferences | null) ?? null,
+    recentJobs: (jobsRes.data as JobListing[]) ?? [],
+  };
+}
+
+export default async function DashboardPage() {
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+
+  if (!user) return null;
+
+  const { profile, resumes, projects, preferences, recentJobs } = await loadDashboardData(user.id);
+  const completion = profileCompletionPercent(profile);
+  const displayName = profile?.full_name || user.email?.split("@")[0] || "there";
+
+  return (
+    <div>
+      <PageHeader
+        title={`Welcome back, ${displayName}`}
+        description="Your job search command center."
+        action={<RunSearchButton />}
+      />
+
+      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+        <Card>
+          <CardHeader>
+            <CardDescription>Profile completion</CardDescription>
+            <CardTitle>{completion}%</CardTitle>
+          </CardHeader>
+          <div className="h-2 overflow-hidden rounded-full bg-zinc-100">
+            <div className="h-full rounded-full bg-accent" style={{ width: `${completion}%` }} />
+          </div>
+          <Link href="/profile" className="mt-4 inline-block text-sm font-medium text-accent hover:underline">
+            Complete profile
+          </Link>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardDescription>Active resume</CardDescription>
+            <CardTitle className="truncate">{activeResumeName(resumes)}</CardTitle>
+          </CardHeader>
+          <Link href="/resumes" className="text-sm font-medium text-accent hover:underline">
+            Manage resumes
+          </Link>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardDescription>Projects stored</CardDescription>
+            <CardTitle>{projects.length}</CardTitle>
+          </CardHeader>
+          <Link href="/projects" className="text-sm font-medium text-accent hover:underline">
+            View projects
+          </Link>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardDescription>Target salary</CardDescription>
+            <CardTitle>{preferencesSalaryLabel(preferences)}</CardTitle>
+          </CardHeader>
+          <p className="text-xs text-muted">
+            Min {formatCurrency(preferences?.salary_min)} · Max {formatCurrency(preferences?.salary_max)}
+          </p>
+        </Card>
+      </div>
+
+      <div className="mt-8 grid gap-6 xl:grid-cols-3">
+        <Card className="xl:col-span-2">
+          <CardHeader>
+            <CardTitle>Top matches</CardTitle>
+            <CardDescription>Highest-scoring jobs from your pipeline.</CardDescription>
+          </CardHeader>
+          {recentJobs.length === 0 ? (
+            <div className="rounded-lg border border-dashed border-border bg-zinc-50 px-4 py-10 text-center text-sm text-muted">
+              No jobs yet. Queue a search from the Jobs page.
+            </div>
+          ) : (
+            <div className="space-y-3">
+              {recentJobs.map((job) => (
+                <Link
+                  key={job.id}
+                  href={`/jobs?job=${job.id}`}
+                  className="flex items-start justify-between gap-4 rounded-lg border border-border px-4 py-3 transition-colors hover:bg-zinc-50"
+                >
+                  <div className="min-w-0">
+                    <p className="truncate font-medium">{job.title}</p>
+                    <p className="truncate text-sm text-muted">
+                      {job.company} ·{" "}
+                      {formatWorkLocationLine({
+                        title: job.title,
+                        location: job.location,
+                        description: job.description,
+                      })}
+                    </p>
+                  </div>
+                  <div className="shrink-0 text-right">
+                    {job.match_score != null ? (
+                      <Badge variant="accent">{job.match_score}% match</Badge>
+                    ) : (
+                      <Badge variant="muted">Unscored</Badge>
+                    )}
+                  </div>
+                </Link>
+              ))}
+            </div>
+          )}
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>Quick setup</CardTitle>
+            <CardDescription>Get the most from scoring once the pipeline connects.</CardDescription>
+          </CardHeader>
+          <ul className="space-y-3 text-sm">
+            <li>
+              <Link href="/profile" className="font-medium text-accent hover:underline">
+                Add your profile
+              </Link>
+            </li>
+            <li>
+              <Link href="/resumes" className="font-medium text-accent hover:underline">
+                Paste an active resume
+              </Link>
+            </li>
+            <li>
+              <Link href="/job-preferences" className="font-medium text-accent hover:underline">
+                Set salary and location preferences
+              </Link>
+            </li>
+            <li>
+              <Link href="/projects" className="font-medium text-accent hover:underline">
+                Document portfolio projects
+              </Link>
+            </li>
+          </ul>
+        </Card>
+      </div>
+    </div>
+  );
+}

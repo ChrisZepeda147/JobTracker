@@ -1,0 +1,16 @@
+{
+  "name": "jobtracker",
+  "private": true,
+  "description": "JobTracker monorepo root — web app lives in ./web",
+  "scripts": {
+    "dev": "node scripts/run-web.mjs",
+    "search": "node scripts/run-dev.mjs",
+    "search:worker": "node scripts/run-worker.mjs",
+    "search:once": "node scripts/run-worker.mjs --once",
+    "search:rescore": "node scripts/run-worker.mjs --rescore-all",
+    "build": "npm run build --prefix web",
+    "start": "npm run start --prefix web",
+    "lint": "npm run lint --prefix web",
+    "install:web": "npm install --prefix web"
+  }
+}

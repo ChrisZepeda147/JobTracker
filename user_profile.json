@@ -1,0 +1,44 @@
+{
+  "_comment": "Paste your resume into resume_text, or leave it empty and set resume_path to a .txt/.md file.",
+
+  "resume_text": "",
+  "resume_path": "resume.txt",
+
+  "target_titles": [
+    "Full Stack Developer",
+    "Full Stack Engineer",
+    "Software Engineer",
+    "Backend Engineer",
+    "Frontend Engineer"
+  ],
+
+  "min_salary": 120000,
+
+  "work_location_preference": "remote",
+
+  "preferred_cities": [
+    "Austin, TX",
+    "Denver, CO",
+    "Seattle, WA"
+  ],
+
+  "blacklisted_companies": [
+    "Robert Half",
+    "TEKsystems",
+    "Insight Global",
+    "Dice"
+  ],
+
+  "_optional": "Everything below has sensible defaults and may be removed.",
+
+  "min_match_score": 60,
+  "top_n": 10,
+  "require_salary_data": false,
+  "search": {
+    "search_term": "Full Stack Developer",
+    "location": "Austin, TX",
+    "is_remote": true,
+    "results_wanted": 20,
+    "hours_old": 24
+  }
+}

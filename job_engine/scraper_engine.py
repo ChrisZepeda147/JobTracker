@@ -238,12 +238,35 @@ def _compose_location(row: dict[str, Any]) -> str:
     state = _safe_str(row.get("state"))
     country = _safe_str(row.get("country"))
     listed = _safe_str(row.get("location"))
-    if city and state:
-        return f"{city}, {state}"
-    if listed:
+
+    # Keep the board's location string when it already encodes work mode.
+    if listed and re.search(
+        r"\b(remote|hybrid|on[- ]?site|in[- ]office|work from home|wfh)\b",
+        listed,
+        re.IGNORECASE,
+    ):
         return listed
-    parts = [part for part in (city, state, country) if part]
-    return ", ".join(parts)
+
+    if city and state:
+        base = f"{city}, {state}"
+    elif listed:
+        base = listed
+    else:
+        parts = [part for part in (city, state, country) if part]
+        base = ", ".join(parts)
+
+    wfh = _safe_str(row.get("work_from_home_type")).lower()
+    is_remote = row.get("is_remote")
+    broad = base.strip().lower() in {"united states", "usa", "us", "u.s.", "u.s.a.", "america", ""}
+
+    if "hybrid" in wfh:
+        return f"Hybrid - {base}" if base else "Hybrid"
+    if wfh in {"remote", "fully remote", "work from home"}:
+        return f"Remote - {base}" if base else "Remote"
+    if is_remote is True and broad:
+        return "Remote" if not base else f"Remote - {base}"
+
+    return base
 
 
 def _format_posted_date(value: Any) -> str | None:

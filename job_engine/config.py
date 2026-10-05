@@ -36,7 +36,9 @@ DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-5"
 # Free tiers are rate limited (Groq ~30 RPM, Gemini ~15 RPM), so only the
 # strongest candidates are sent to an API.
 DEFAULT_MAX_JOBS_TO_SCORE = 20
-DEFAULT_DAILY_JOB_LIMIT = 15
+DEFAULT_SEARCH_RESULT_LIMIT = 45
+DEFAULT_RESULTS_WANTED_PER_QUERY = 25
+DEFAULT_DAILY_JOB_LIMIT = DEFAULT_SEARCH_RESULT_LIMIT
 
 PROVIDER_GEMINI = "gemini"
 PROVIDER_GROQ = "groq"
@@ -93,8 +95,12 @@ class Settings:
     anthropic_model: str = DEFAULT_ANTHROPIC_MODEL
 
     max_jobs_to_score: int = DEFAULT_MAX_JOBS_TO_SCORE
+    search_result_limit: int = DEFAULT_SEARCH_RESULT_LIMIT
+    results_wanted_per_query: int = DEFAULT_RESULTS_WANTED_PER_QUERY
     daily_job_limit: int = DEFAULT_DAILY_JOB_LIMIT
     proxy_list: list[str] = field(default_factory=list)
+    greenhouse_board_slugs: list[str] = field(default_factory=list)
+    wellfound_api_key: str = ""
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -114,15 +120,32 @@ class Settings:
         raw_proxies = _clean("PROXY_LIST")
         proxies = [p.strip() for p in raw_proxies.split(",") if p.strip()] if raw_proxies else []
 
+        from job_engine.greenhouse_boards import DEFAULT_GREENHOUSE_BOARD_SLUGS, parse_board_slug_list
+
+        raw_boards = _clean("GREENHOUSE_BOARD_SLUGS")
+        if raw_boards:
+            greenhouse_boards = parse_board_slug_list(raw_boards)
+        else:
+            greenhouse_boards = list(DEFAULT_GREENHOUSE_BOARD_SLUGS)
+
         try:
             max_score = int(_clean("MAX_JOBS_TO_SCORE") or DEFAULT_MAX_JOBS_TO_SCORE)
         except ValueError:
             max_score = DEFAULT_MAX_JOBS_TO_SCORE
 
         try:
-            daily_limit = int(_clean("DAILY_JOB_LIMIT") or DEFAULT_DAILY_JOB_LIMIT)
+            search_limit = int(
+                _clean("SEARCH_RESULT_LIMIT") or _clean("DAILY_JOB_LIMIT") or DEFAULT_SEARCH_RESULT_LIMIT
+            )
         except ValueError:
-            daily_limit = DEFAULT_DAILY_JOB_LIMIT
+            search_limit = DEFAULT_SEARCH_RESULT_LIMIT
+
+        try:
+            results_wanted = int(
+                _clean("RESULTS_WANTED_PER_QUERY") or DEFAULT_RESULTS_WANTED_PER_QUERY
+            )
+        except ValueError:
+            results_wanted = DEFAULT_RESULTS_WANTED_PER_QUERY
 
         return cls(
             supabase_url=_clean("SUPABASE_URL"),
@@ -137,8 +160,12 @@ class Settings:
             cohere_model=_clean("COHERE_MODEL") or DEFAULT_COHERE_MODEL,
             anthropic_model=_clean("ANTHROPIC_MODEL") or DEFAULT_ANTHROPIC_MODEL,
             max_jobs_to_score=max_score,
-            daily_job_limit=max(1, daily_limit),
+            search_result_limit=max(1, search_limit),
+            results_wanted_per_query=max(1, results_wanted),
+            daily_job_limit=max(1, search_limit),
             proxy_list=proxies,
+            greenhouse_board_slugs=greenhouse_boards,
+            wellfound_api_key=_clean("WELLFOUND_API_KEY"),
         )
 
     def available_providers(self) -> list[str]:

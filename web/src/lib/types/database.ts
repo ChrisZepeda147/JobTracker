@@ -49,9 +49,13 @@ export type JobPreferences = {
   remote_allowed: boolean;
   hybrid_allowed: boolean;
   onsite_allowed: boolean;
+  home_zip: string | null;
+  max_commute_miles: number | null;
   excluded_seniority: string[];
   excluded_keywords: string[];
   additional_instructions: string;
+  search_sources: string[];
+  posted_within_days: number | null;
   created_at: string;
   updated_at: string;
 };

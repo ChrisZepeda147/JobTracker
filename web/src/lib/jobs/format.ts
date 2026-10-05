@@ -21,6 +21,19 @@ export function formatPostedDate(value: string | null | undefined): string | nul
   return date.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
 }
 
+export function formatAppliedAt(value: string | null | undefined): string | null {
+  if (!value) return null;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toLocaleString("en-US", {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
 export function formatSource(site: string | null | undefined): string | null {
   if (!site) return null;
   const labels: Record<string, string> = {
@@ -54,6 +67,32 @@ const REMOTE_RE =
 const HYBRID_RE =
   /\b(hybrid|partially remote|flexible hybrid|\d+\s+days?\s+(?:a\s+week\s+)?in[- ]?office)\b/i;
 const ONSITE_RE = /\b(on[- ]?site|in[- ]?office|in person|office[- ]based)\b/i;
+const ARRANGEMENT_LINE_RE =
+  /^\s*(remote|hybrid|on[- ]?site|onsite|in[- ]?office|in office)\s*$/im;
+
+export function sanitizeJobLocation(location: string): string {
+  let text = location.trim();
+  if (text.includes("·")) {
+    text = text.split("·", 1)[0].trim();
+  }
+  return text.replace(/,\s*(?:US|USA|U\.S\.A?\.?|United States(?: of America)?)\s*$/i, "").trim();
+}
+
+function workModeFromDescriptionLines(description: string | null | undefined): WorkArrangement | null {
+  if (!description) return null;
+  const lines = description.split(/\r?\n/).slice(0, 30);
+  for (const line of lines) {
+    const match = ARRANGEMENT_LINE_RE.exec(line.trim());
+    if (!match) continue;
+    const token = match[1].toLowerCase().replace(/\s+/g, "");
+    if (token === "remote") return "Remote";
+    if (token === "hybrid") return "Hybrid";
+    if (token === "onsite" || token === "on-site" || token === "inoffice" || token === "in-office") {
+      return "Onsite";
+    }
+  }
+  return null;
+}
 
 const US_BROAD_LOCATION_RE =
   /^(?:united states(?:\s+of\s+america)?|usa|u\.?s\.?a?\.?|us|america)(?:\s*[-–—•|]\s*)?$/i;
@@ -70,17 +109,26 @@ function normalizeGeographicLocation(location: string): string {
     .trim();
 }
 
+/** Mirrors worker effective_work_mode / detect_work_mode ordering. */
 export function detectWorkArrangement(job: {
   title: string;
   location: string;
   description?: string | null;
 }): WorkArrangement {
-  const location = job.location || "";
-  const normalizedLocation = normalizeGeographicLocation(location);
+  const fromLines = workModeFromDescriptionLines(job.description);
+  if (fromLines) return fromLines;
 
-  if (REMOTE_RE.test(location)) return "Remote";
+  const location = sanitizeJobLocation(job.location || "");
+  const normalizedLocation = normalizeGeographicLocation(location);
+  const head = `${job.title}\n${(job.description || "").slice(0, 2500)}`;
+
   if (HYBRID_RE.test(location)) return "Hybrid";
   if (ONSITE_RE.test(location)) return "Onsite";
+  if (REMOTE_RE.test(location)) {
+    if (HYBRID_RE.test(head)) return "Hybrid";
+    if (ONSITE_RE.test(head)) return "Onsite";
+    return "Remote";
+  }
 
   if (US_BROAD_LOCATION_RE.test(normalizedLocation) || US_BROAD_LOCATION_RE.test(location.trim())) {
     return "Remote";
@@ -88,10 +136,33 @@ export function detectWorkArrangement(job: {
 
   const text = `${job.title}\n${job.description || ""}`.slice(0, 8000);
   if (HYBRID_RE.test(text)) return "Hybrid";
-  if (REMOTE_RE.test(text)) return "Remote";
   if (ONSITE_RE.test(text)) return "Onsite";
+  if (REMOTE_RE.test(text)) return "Remote";
 
   return "Unknown";
+}
+
+const STORED_ARRANGEMENT: Record<string, WorkArrangement> = {
+  remote: "Remote",
+  hybrid: "Hybrid",
+  onsite: "Onsite",
+  unknown: "Unknown",
+};
+
+/** Prefer filter verdict from the worker; fall back to heuristics. */
+export function effectiveWorkArrangement(
+  job: {
+    title: string;
+    location: string;
+    description?: string | null;
+  },
+  stored: string | null | undefined,
+): WorkArrangement {
+  const key = stored?.trim().toLowerCase();
+  if (key && key in STORED_ARRANGEMENT && key !== "unknown") {
+    return STORED_ARRANGEMENT[key];
+  }
+  return detectWorkArrangement(job);
 }
 
 function stripArrangementPrefix(location: string, arrangement: WorkArrangement): string {
@@ -123,21 +194,49 @@ function stripArrangementPrefix(location: string, arrangement: WorkArrangement):
   return geographic;
 }
 
-export function formatWorkLocationLine(job: {
-  title: string;
-  location: string;
-  description?: string | null;
-}): string {
-  const arrangement = detectWorkArrangement(job);
-  const geographic = stripArrangementPrefix(job.location || "", arrangement);
+export function formatWorkLocationLine(
+  job: {
+    title: string;
+    location: string;
+    description?: string | null;
+  },
+  commuteMiles?: number | null,
+  storedArrangement?: string | null,
+): string {
+  const arrangement = effectiveWorkArrangement(job, storedArrangement);
+  const geographic = stripArrangementPrefix(sanitizeJobLocation(job.location || ""), arrangement);
+
+  if (arrangement === "Remote") {
+    const geo = geographic.trim();
+    const isBroad =
+      !geo ||
+      US_BROAD_LOCATION_RE.test(geo) ||
+      /^(united states|usa|u\.?s\.?)$/i.test(geo);
+    if (!isBroad) {
+      return "Fully remote • United States";
+    }
+    return geo ? `Fully remote • ${geo}` : "Fully remote";
+  }
 
   if (arrangement === "Unknown") {
-    if (geographic) return geographic;
-    return "Unknown";
+    if (geographic) {
+      if (commuteMiles != null) {
+        return `${geographic} • ${Math.round(commuteMiles)} miles`;
+      }
+      return geographic;
+    }
+    return commuteMiles != null ? `Location Unverified • ${Math.round(commuteMiles)} miles` : "Location Unverified";
   }
 
   if (!geographic) {
+    if (commuteMiles != null && arrangement !== "Remote") {
+      return `${arrangement} • ${Math.round(commuteMiles)} miles`;
+    }
     return arrangement;
+  }
+
+  if (commuteMiles != null && arrangement !== "Remote") {
+    return `${arrangement} • ${geographic} • ${Math.round(commuteMiles)} miles`;
   }
 
   return `${arrangement} • ${geographic}`;

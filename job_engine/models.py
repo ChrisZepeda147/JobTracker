@@ -50,6 +50,18 @@ class RawJob:
     missing_skills: list[str] = field(default_factory=list)
     scored_by: str | None = None
 
+    # Populated by location hard filter (per-user commute evaluation).
+    commute_miles: float | None = None
+    work_arrangement: str | None = None
+    location_status: str | None = None
+    salary_status: str | None = None
+    keyword_status: str | None = None
+    experience_status: str | None = None
+    education_status: str | None = None
+    experience_requirement: str | None = None
+    salary_page_checked: bool = False
+    is_stretch: bool = False
+
     def generate_hash(self) -> str:
         """MD5 of company + title + location for strict cross-board deduplication."""
         key = "|".join(

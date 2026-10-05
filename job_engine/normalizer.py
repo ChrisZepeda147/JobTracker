@@ -61,8 +61,8 @@ _K_SUFFIX = re.compile(r"^([\d,.]+)\s*[kK]$")
 _PLAIN_NUMBER = re.compile(r"^[\d,.]+$")
 _SALARY_IN_TEXT = re.compile(
     r"""
-    \$?\s*(?P<min>[\d,]+(?:\.\d+)?)\s*(?P<min_k>[kK])?
-    (?:\s*(?:-|–|—|to)\s*\$?\s*(?P<max>[\d,]+(?:\.\d+)?)\s*(?P<max_k>[kK])?)?
+    \$?\s*(?P<min>\d[\d,]*(?:\.\d+)?)\s*(?P<min_k>[kK])?
+    (?:\s*(?:-|–|—|to)\s*\$?\s*(?P<max>\d[\d,]*(?:\.\d+)?)\s*(?P<max_k>[kK])?)?
     \s*(?P<unit>per\s+year|per\s+annum|per\s+hour|per\s+month|per\s+week|/yr|/year|yearly|annually|annual|/hr|hourly|/mo|monthly|a\s+year|a\s+month|an\s+hour)?
     """,
     re.IGNORECASE | re.VERBOSE,
@@ -73,6 +73,11 @@ _SALARY_HINT = re.compile(r"(salary|compensation|pay|range|\$\s*\d)", re.IGNOREC
 # would otherwise defeat the company+title+location dedup hash.
 _TRAILING_COUNTRY_RE = re.compile(
     r",\s*(?:us|usa|u\.s\.a?\.?|united states(?: of america)?)\s*$", re.IGNORECASE
+)
+# LinkedIn packs metadata into the location field after middle dots.
+_LINKEDIN_LOCATION_NOISE_RE = re.compile(
+    r"\s*[·•|]\s*(?:reposted|over\s+\d+|promoted|responses managed).*",
+    re.IGNORECASE,
 )
 
 
@@ -230,16 +235,41 @@ def extract_salary_from_text(text: str | None) -> tuple[float | None, float | No
     """Best-effort salary range extraction when a board omitted structured pay data."""
     if not text or not _SALARY_HINT.search(text):
         return None, None
-    match = _SALARY_IN_TEXT.search(text)
-    if not match:
-        return None, None
-    unit = match.group("unit")
-    minimum = _parse_money_token(match.group("min"), match.group("min_k"))
-    maximum = _parse_money_token(match.group("max"), match.group("max_k"))
-    if minimum is None:
-        return None, None
-    inferred = unit or infer_interval_from_amount(minimum)
-    return annualize_salary(minimum, inferred), annualize_salary(maximum, inferred)
+
+    best: tuple[float | None, float | None] = (None, None)
+    best_score = -1.0
+
+    for match in _SALARY_IN_TEXT.finditer(text):
+        unit = match.group("unit")
+        minimum = _parse_money_token(match.group("min"), match.group("min_k"))
+        maximum = _parse_money_token(match.group("max"), match.group("max_k"))
+        if minimum is None:
+            continue
+        inferred = unit or infer_interval_from_amount(minimum)
+        annual_min = annualize_salary(minimum, inferred)
+        annual_max = annualize_salary(maximum, inferred) if maximum is not None else annual_min
+        if annual_min is None:
+            continue
+        if annual_max is None:
+            annual_max = annual_min
+        if annual_min > annual_max:
+            annual_min, annual_max = annual_max, annual_min
+
+        # Ignore stipends, hourly gigs mis-parsed as yearly, and obvious noise.
+        if annual_min < 15_000 or annual_max > 1_000_000:
+            continue
+
+        midpoint = (annual_min + annual_max) / 2.0
+        score = midpoint
+        if unit and "year" in unit.lower():
+            score += 50_000
+        if maximum is not None:
+            score += 10_000
+        if score > best_score:
+            best_score = score
+            best = (annual_min, annual_max)
+
+    return best
 
 
 def _clean_text_field(value: str | None) -> str:
@@ -249,6 +279,9 @@ def _clean_text_field(value: str | None) -> str:
 def normalize_location(value: str | None) -> str:
     """Strip trailing country suffixes so boards agree on the same place."""
     text = strip_html(value)
+    if "·" in text:
+        text = text.split("·", 1)[0].strip()
+    text = _LINKEDIN_LOCATION_NOISE_RE.sub("", text).strip()
     return _TRAILING_COUNTRY_RE.sub("", text).strip().rstrip(",").strip()
 
 

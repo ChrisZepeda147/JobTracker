@@ -5,16 +5,24 @@ import { createClient } from "@/lib/supabase/client";
 import { PageHeader } from "@/components/layout/sidebar";
 import { JobCard } from "@/components/jobs/job-card";
 import { JobSearchHistory } from "@/components/jobs/job-search-history";
+import { JobPreferencesSummary } from "@/components/jobs/job-preferences-summary";
 import { JobSearchPanel } from "@/components/jobs/job-search-panel";
 import { SkipReasonDialog } from "@/components/jobs/skip-reason-dialog";
-import { JOB_TABS, type JobTabId, type SkipReasonId } from "@/lib/jobs/constants";
+import { DEFAULT_POSTED_WITHIN_DAYS, JOB_TABS, type JobTabId, type SkipReasonId } from "@/lib/jobs/constants";
+import { isListingTooOld } from "@/lib/jobs/listing-age";
 import {
   countForTab,
   defaultsFromPreferences,
   jobMatchesTab,
+  locationPrefsFromPreferences,
   mergeJobsWithStates,
+  sortJobsByMatchScore,
+  sortJobsForTab,
   type SearchFormDefaults,
+  type SearchScope,
 } from "@/lib/jobs/logic";
+import { queueReevaluateStoredJobs } from "@/lib/jobs/maintenance";
+import { salaryPrefsFromPreferences } from "@/lib/jobs/salary-filter";
 import type { JobRecord, JobSearchRequest, UserJobState } from "@/lib/types/jobs";
 import type { JobPreferences } from "@/lib/types/database";
 import { cn } from "@/lib/utils/cn";
@@ -34,14 +42,41 @@ export function JobsBoard({ userId, preferences, focusJobId = null }: JobsBoardP
   const [searchRequests, setSearchRequests] = useState<JobSearchRequest[]>([]);
   const [searchesLoading, setSearchesLoading] = useState(true);
   const [skipTarget, setSkipTarget] = useState<JobRecord | null>(null);
+  const [highlightedJobId, setHighlightedJobId] = useState<string | null>(null);
+  const [includeOlderListings, setIncludeOlderListings] = useState(false);
 
   const searchDefaults = useMemo(() => defaultsFromPreferences(preferences), [preferences]);
+  const excludedKeywords = useMemo(
+    () => (preferences?.excluded_keywords ?? []).map((k) => k.trim()).filter(Boolean),
+    [preferences],
+  );
+  const salaryPrefs = useMemo(() => salaryPrefsFromPreferences(preferences), [preferences]);
+  const locationPrefs = useMemo(() => locationPrefsFromPreferences(preferences), [preferences]);
+  const maxPreferredExperienceYears = preferences?.max_preferred_experience_years ?? null;
+  const listingAgePrefs = useMemo(
+    () => ({
+      maxAgeDays: preferences?.posted_within_days ?? DEFAULT_POSTED_WITHIN_DAYS,
+      includeOlder: includeOlderListings,
+    }),
+    [preferences?.posted_within_days, includeOlderListings],
+  );
 
-  const rescorePending = useMemo(
+  const hiddenOlderCount = useMemo(
+    () =>
+      jobs.filter((job) =>
+        isListingTooOld(job, {
+          maxAgeDays: listingAgePrefs.maxAgeDays,
+          includeOlder: false,
+        }),
+      ).length,
+    [jobs, listingAgePrefs.maxAgeDays],
+  );
+
+  const maintenancePending = useMemo(
     () =>
       searchRequests.some(
         (request) =>
-          request.rescore_only &&
+          (request.rescore_only || request.refilter_only) &&
           (request.status === "pending" || request.status === "running"),
       ),
     [searchRequests],
@@ -104,7 +139,7 @@ export function JobsBoard({ userId, preferences, focusJobId = null }: JobsBoardP
   }, [loadJobs, loadSearchRequests]);
 
   useEffect(() => {
-    if (!rescorePending) {
+    if (!maintenancePending) {
       return;
     }
     const timer = window.setInterval(() => {
@@ -112,7 +147,7 @@ export function JobsBoard({ userId, preferences, focusJobId = null }: JobsBoardP
       void loadJobs();
     }, 5000);
     return () => window.clearInterval(timer);
-  }, [rescorePending, loadJobs, loadSearchRequests]);
+  }, [maintenancePending, loadJobs, loadSearchRequests]);
 
   useEffect(() => {
     if (!focusJobId || loading || jobs.length === 0) {
@@ -123,7 +158,17 @@ export function JobsBoard({ userId, preferences, focusJobId = null }: JobsBoardP
       return;
     }
     for (const tab of JOB_TABS) {
-      if (jobMatchesTab(job, tab.id)) {
+      if (
+        jobMatchesTab(
+          job,
+          tab.id,
+          excludedKeywords,
+          salaryPrefs,
+          maxPreferredExperienceYears,
+          locationPrefs,
+          listingAgePrefs,
+        )
+      ) {
         setActiveTab(tab.id);
         break;
       }
@@ -134,19 +179,81 @@ export function JobsBoard({ userId, preferences, focusJobId = null }: JobsBoardP
         block: "center",
       });
     });
-  }, [focusJobId, loading, jobs]);
+  }, [
+    focusJobId,
+    loading,
+    jobs,
+    excludedKeywords,
+    salaryPrefs,
+    maxPreferredExperienceYears,
+    locationPrefs,
+    listingAgePrefs,
+  ]);
+
+  useEffect(() => {
+    if (!highlightedJobId || activeTab !== "needs_decision") {
+      return;
+    }
+    requestAnimationFrame(() => {
+      document.getElementById(`job-${highlightedJobId}`)?.scrollIntoView({
+        behavior: "smooth",
+        block: "center",
+      });
+    });
+  }, [highlightedJobId, activeTab]);
+
+  function clearHighlightIfResolved(jobId: string) {
+    setHighlightedJobId((current) => (current === jobId ? null : current));
+  }
+
+  const pinJobId = activeTab === "needs_decision" ? highlightedJobId : null;
 
   const visibleJobs = useMemo(
-    () => jobs.filter((job) => jobMatchesTab(job, activeTab)),
-    [jobs, activeTab],
+    () =>
+      sortJobsForTab(
+        jobs.filter((job) =>
+          jobMatchesTab(
+            job,
+            activeTab,
+            excludedKeywords,
+            salaryPrefs,
+            maxPreferredExperienceYears,
+            locationPrefs,
+            listingAgePrefs,
+          ),
+        ),
+        activeTab,
+        pinJobId,
+      ),
+    [
+      jobs,
+      activeTab,
+      excludedKeywords,
+      salaryPrefs,
+      maxPreferredExperienceYears,
+      locationPrefs,
+      listingAgePrefs,
+      pinJobId,
+    ],
   );
 
   const tabCounts = useMemo(
-    () => Object.fromEntries(JOB_TABS.map((t) => [t.id, countForTab(jobs, t.id)])) as Record<
-      JobTabId,
-      number
-    >,
-    [jobs],
+    () =>
+      Object.fromEntries(
+        JOB_TABS.map((t) => [
+          t.id,
+          countForTab(
+            jobs,
+            t.id,
+            excludedKeywords,
+            salaryPrefs,
+            maxPreferredExperienceYears,
+            locationPrefs,
+            listingAgePrefs,
+          ),
+        ]),
+      ) as Record<JobTabId, number>,
+    [jobs, excludedKeywords, salaryPrefs, maxPreferredExperienceYears, locationPrefs, listingAgePrefs],
   );
 
   async function upsertState(jobId: string, patch: Record<string, unknown>) {
@@ -172,58 +279,111 @@ export function JobsBoard({ userId, preferences, focusJobId = null }: JobsBoardP
     await loadJobs();
   }
 
-  async function handleSearch(form: SearchFormDefaults) {
+  async function handleSourcesChange(sources: string[]) {
+    const supabase = createClient();
+    if (preferences) {
+      const { error } = await supabase
+        .from("job_preferences")
+        .update({ search_sources: sources })
+        .eq("user_id", userId);
+      if (error) throw new Error(error.message);
+      return;
+    }
+    const { error } = await supabase.from("job_preferences").insert({
+      user_id: userId,
+      target_roles: [],
+      preferred_locations: [],
+      remote_allowed: true,
+      hybrid_allowed: true,
+      onsite_allowed: false,
+      excluded_seniority: [],
+      excluded_keywords: [],
+      additional_instructions: "",
+      search_sources: sources,
+    });
+    if (error) throw new Error(error.message);
+  }
+
+  async function handleSearch(form: SearchFormDefaults, scope: SearchScope) {
     const supabase = createClient();
     const titles = form.titles.map((t) => t.trim()).filter(Boolean);
+    const isRemoteUs = scope === "remote_us";
     const { error: insertError } = await supabase.from("job_search_requests").insert({
       user_id: userId,
       query: titles[0] ?? "",
       titles,
-      location: form.location.trim(),
-      location_zip: form.locationZip.trim() || null,
+      location: isRemoteUs ? "United States" : form.location.trim(),
+      location_zip: isRemoteUs ? null : form.locationZip.trim() || null,
       salary_min: form.salaryMin ? Number(form.salaryMin) : null,
       salary_max: form.salaryMax ? Number(form.salaryMax) : null,
       posted_within_days: form.postedWithinDays,
-      remote_allowed: form.remoteAllowed,
-      hybrid_allowed: form.hybridAllowed,
-      onsite_allowed: form.onsiteAllowed,
+      remote_allowed: true,
+      hybrid_allowed: isRemoteUs ? false : form.hybridAllowed,
+      onsite_allowed: isRemoteUs ? false : form.onsiteAllowed,
       max_onsite_miles:
-        form.hybridAllowed || form.onsiteAllowed ? form.maxOnsiteMiles : null,
+        !isRemoteUs && (form.hybridAllowed || form.onsiteAllowed) ? form.maxOnsiteMiles : null,
       sources: form.sources,
+      nationwide_remote: isRemoteUs,
       status: "pending",
     });
     if (insertError) throw new Error(insertError.message);
-    setSearchMessage("Search queued. Results will appear shortly.");
+    setSearchMessage(
+      isRemoteUs
+        ? "US remote search queued. Results will appear shortly."
+        : "Local / commute search queued. Results will appear shortly.",
+    );
     await loadSearchRequests();
   }
 
-  async function handleRescore() {
-    if (rescorePending) {
-      setSearchMessage("A rescore is already queued or running.");
+  async function handleReevaluate() {
+    if (maintenancePending) {
+      setSearchMessage("A re-evaluation is already queued or running.");
       return;
     }
-    const supabase = createClient();
-    const { error: insertError } = await supabase.from("job_search_requests").insert({
-      user_id: userId,
-      query: "",
-      titles: [],
-      location: "",
-      sources: [],
-      rescore_only: true,
-      status: "pending",
-    });
-    if (insertError) throw new Error(insertError.message);
-    setSearchMessage("Rescore queued. Existing jobs will be re-ranked shortly.");
+    await queueReevaluateStoredJobs(userId);
+    setSearchMessage(
+      "Re-evaluation queued. Stored jobs will be re-filtered (location, remote/hybrid, salary, education, etc.) and re-ranked.",
+    );
     await loadSearchRequests();
   }
 
   async function handleApply(job: JobRecord) {
     window.open(job.job_url, "_blank", "noopener,noreferrer");
+    const clickedAt = new Date().toISOString();
+    setHighlightedJobId(job.id);
+    setActiveTab("needs_decision");
+    setJobs((prev) =>
+      prev.map((entry) =>
+        entry.id === job.id
+          ? {
+              ...entry,
+              user_state: {
+                ...(entry.user_state ?? {
+                  user_id: userId,
+                  job_id: job.id,
+                  skip_reason: null,
+                  user_notes: "",
+                  commute_miles: null,
+                  work_arrangement: null,
+                  location_status: null,
+                  salary_status: null,
+                  keyword_status: null,
+                  experience_status: null,
+                  education_status: null,
+                  created_at: clickedAt,
+                  updated_at: clickedAt,
+                }),
+                status: "opened",
+                apply_clicked_at: clickedAt,
+              },
+            }
+          : entry,
+      ),
+    );
     await upsertState(job.id, {
       status: "opened",
-      apply_clicked_at: new Date().toISOString(),
+      apply_clicked_at: clickedAt,
     });
-    setActiveTab("needs_decision");
   }
 
   async function handleMarkApplied(job: JobRecord) {
@@ -231,21 +391,30 @@ export function JobsBoard({ userId, preferences, focusJobId = null }: JobsBoardP
       status: "applied",
       applied_at: new Date().toISOString(),
     });
+    clearHighlightIfResolved(job.id);
     setActiveTab("applied");
   }
 
   async function handleApplyLater(job: JobRecord) {
     await upsertState(job.id, { status: "apply_later" });
-    setActiveTab("apply_later");
+    clearHighlightIfResolved(job.id);
+    if (activeTab !== "needs_decision") {
+      setActiveTab("apply_later");
+    }
   }
 
   async function handleSkipConfirm(reason: SkipReasonId, notes: string) {
     if (!skipTarget) return;
-    await upsertState(skipTarget.id, {
+    const patch: Record<string, unknown> = {
       status: "skipped",
       skip_reason: reason,
       user_notes: notes,
-    });
+    };
+    if (reason === "salary_too_low" || reason === "salary_too_high") {
+      patch.salary_status = "rejected";
+    }
+    await upsertState(skipTarget.id, patch);
+    clearHighlightIfResolved(skipTarget.id);
     setSkipTarget(null);
     setActiveTab("skipped");
   }
@@ -257,14 +426,33 @@ export function JobsBoard({ userId, preferences, focusJobId = null }: JobsBoardP
         description="Browse matches, track applications, and queue new searches."
       />
 
-      <div className="mb-6" id="find-jobs">
+      <JobPreferencesSummary preferences={preferences} />
+
+      <div id="find-jobs">
         <JobSearchPanel
-          defaults={searchDefaults}
+          searchParams={searchDefaults}
           onSubmit={handleSearch}
-          onRescore={handleRescore}
-          rescorePending={rescorePending}
+          onSourcesChange={handleSourcesChange}
+          onReevaluate={handleReevaluate}
+          reevaluatePending={maintenancePending}
           lastRequestMessage={searchMessage}
         />
+      </div>
+
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-white px-3 py-2">
+        <p className="text-xs text-muted">
+          Hiding listings older than {listingAgePrefs.maxAgeDays} days
+          {hiddenOlderCount > 0 ? ` (${hiddenOlderCount} hidden)` : ""}.
+        </p>
+        <label className="flex cursor-pointer items-center gap-2 text-xs font-medium text-foreground">
+          <input
+            type="checkbox"
+            className="rounded border-border"
+            checked={includeOlderListings}
+            onChange={(e) => setIncludeOlderListings(e.target.checked)}
+          />
+          Show older listings
+        </label>
       </div>
 
       <div className="mb-4 flex gap-1 overflow-x-auto border-b border-border pb-px">
@@ -272,7 +460,12 @@ export function JobsBoard({ userId, preferences, focusJobId = null }: JobsBoardP
           <button
             key={tab.id}
             type="button"
-            onClick={() => setActiveTab(tab.id)}
+            onClick={() => {
+              setActiveTab(tab.id);
+              if (tab.id !== "needs_decision") {
+                setHighlightedJobId(null);
+              }
+            }}
             className={cn(
               "whitespace-nowrap rounded-t-lg px-4 py-2.5 text-sm font-medium transition-colors",
               activeTab === tab.id
@@ -295,7 +488,9 @@ export function JobsBoard({ userId, preferences, focusJobId = null }: JobsBoardP
           <p className="mt-1 text-sm text-muted">
             {activeTab === "new"
               ? "Run npm run search to start the app and worker, then queue a search above."
-              : "Jobs will appear here as you interact with listings."}
+              : activeTab === "new_remote"
+                ? "Remote US jobs from your searches will appear here after the worker runs."
+                : "Jobs will appear here as you interact with listings."}
           </p>
         </div>
       ) : null}
@@ -305,7 +500,8 @@ export function JobsBoard({ userId, preferences, focusJobId = null }: JobsBoardP
           <JobCard
             key={job.id}
             job={job}
-            highlighted={focusJobId === job.id}
+            highlighted={focusJobId === job.id || highlightedJobId === job.id}
+            justApplied={highlightedJobId === job.id}
             onApply={handleApply}
             onMarkApplied={handleMarkApplied}
             onApplyLater={handleApplyLater}

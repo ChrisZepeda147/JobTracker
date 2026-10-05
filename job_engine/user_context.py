@@ -6,6 +6,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+from job_engine.job_feedback import JobFeedbackContext, apply_feedback_to_profile, load_job_feedback
 from job_engine.location_utils import ZipInfo, resolve_us_zip, scraper_location
 from job_engine.matcher import UserProfile
 from job_engine.search_models import SearchRequest
@@ -88,7 +89,8 @@ def build_profile_from_supabase(
             target_roles.insert(0, title)
 
     preferred_cities = list(prefs.get("preferred_locations") or [])
-    resolved_location = scraper_location(request.location, request.location_zip)
+    home_zip = prefs.get("home_zip") or request.location_zip
+    resolved_location = scraper_location(request.location, home_zip)
     if resolved_location and resolved_location not in preferred_cities:
         preferred_cities.insert(0, resolved_location)
     elif request.location.strip() and request.location.strip() not in preferred_cities:
@@ -121,7 +123,7 @@ def build_profile_from_supabase(
             "search_term": primary_title,
             "location": resolved_location,
             "is_remote": request.remote_allowed and not request.onsite_allowed,
-            "results_wanted": 20,
+            "results_wanted": 10,
             "hours_old": request.hours_old(),
         },
     )
@@ -130,18 +132,26 @@ def build_profile_from_supabase(
 @dataclass
 class UserSearchContext:
     profile: UserProfile
+    feedback: JobFeedbackContext
     excluded_seniority: list[str]
     excluded_keywords: list[str]
     request_salary_max: float | None
     request_remote_allowed: bool
     request_hybrid_allowed: bool
     request_onsite_allowed: bool
+    prefs_remote_allowed: bool
+    prefs_hybrid_allowed: bool
+    prefs_onsite_allowed: bool
+    prefs_salary_min: float | None
+    prefs_salary_max: float | None
+    max_preferred_experience_years: int | None
     origin_zip: ZipInfo | None
-    max_onsite_miles: int | None
+    max_commute_miles: int | None
 
 
 def load_user_rescore_profile(database: Any, user_id: str) -> UserProfile:
     """Build a UserProfile from stored preferences and candidate context (no scrape)."""
+    feedback = load_job_feedback(database, user_id)
     prefs = database.load_job_preferences(user_id) or {}
     resume_text = database.load_active_resume_text(user_id)
     candidate_profile = database.load_candidate_profile(user_id)
@@ -160,7 +170,7 @@ def load_user_rescore_profile(database: Any, user_id: str) -> UserProfile:
 
     salary_floor = prefs.get("salary_min")
 
-    return UserProfile(
+    profile = UserProfile(
         resume_text=resume_text,
         technical_skills=technical_skills,
         profile_text=profile_text,
@@ -179,35 +189,61 @@ def load_user_rescore_profile(database: Any, user_id: str) -> UserProfile:
         require_salary_data=False,
         search={},
     )
+    return apply_feedback_to_profile(profile, feedback)
 
 
 def load_user_search_context(database: Any, user_id: str, request: SearchRequest) -> UserSearchContext:
+    feedback = load_job_feedback(database, user_id)
     prefs = database.load_job_preferences(user_id)
     resume_text = database.load_active_resume_text(user_id)
     candidate_profile = database.load_candidate_profile(user_id)
     projects = database.load_user_projects(user_id)
-    profile = build_profile_from_supabase(
-        request,
-        prefs,
-        resume_text,
-        candidate_profile=candidate_profile,
-        projects=projects,
+    profile = apply_feedback_to_profile(
+        build_profile_from_supabase(
+            request,
+            prefs,
+            resume_text,
+            candidate_profile=candidate_profile,
+            projects=projects,
+        ),
+        feedback,
     )
 
     salary_max = request.salary_max
     if salary_max is None and prefs and prefs.get("salary_max") is not None:
         salary_max = float(prefs["salary_max"])
 
-    zip_info = resolve_us_zip(request.location_zip)
+    home_zip = (prefs or {}).get("home_zip") or request.location_zip
+    zip_info = resolve_us_zip(home_zip)
+
+    max_commute = (prefs or {}).get("max_commute_miles")
+    if max_commute is not None:
+        max_commute = int(max_commute)
+    elif request.max_onsite_miles is not None:
+        max_commute = int(request.max_onsite_miles)
+
+    salary_floor = prefs.get("salary_min")
+    pref_max = prefs.get("salary_max")
 
     return UserSearchContext(
         profile=profile,
+        feedback=feedback,
         excluded_seniority=list((prefs or {}).get("excluded_seniority") or []),
         excluded_keywords=list((prefs or {}).get("excluded_keywords") or []),
         request_salary_max=salary_max,
         request_remote_allowed=request.remote_allowed,
         request_hybrid_allowed=request.hybrid_allowed,
         request_onsite_allowed=request.onsite_allowed,
+        prefs_remote_allowed=bool((prefs or {}).get("remote_allowed", True)),
+        prefs_hybrid_allowed=bool((prefs or {}).get("hybrid_allowed", True)),
+        prefs_onsite_allowed=bool((prefs or {}).get("onsite_allowed", False)),
+        prefs_salary_min=float(salary_floor) if salary_floor is not None else None,
+        prefs_salary_max=float(pref_max) if pref_max is not None else None,
+        max_preferred_experience_years=(
+            int((prefs or {})["max_preferred_experience_years"])
+            if (prefs or {}).get("max_preferred_experience_years") is not None
+            else None
+        ),
         origin_zip=zip_info,
-        max_onsite_miles=request.max_onsite_miles,
+        max_commute_miles=max_commute,
     )

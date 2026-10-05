@@ -1,5 +1,6 @@
 import Link from "next/link";
 import { createClient } from "@/lib/supabase/server";
+import { ApplicationDashboard } from "@/components/dashboard/application-dashboard";
 import { PageHeader, RunSearchButton } from "@/components/layout/sidebar";
 import { Card, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -10,29 +11,77 @@ import {
   profileCompletionPercent,
 } from "@/lib/utils/dashboard";
 import { formatWorkLocationLine } from "@/lib/jobs/format";
-import type { CandidateProfile, JobListing, JobPreferences, Project, Resume } from "@/lib/types/database";
+import { DEFAULT_POSTED_WITHIN_DAYS } from "@/lib/jobs/constants";
+import {
+  isDashboardTopMatch,
+  locationPrefsFromPreferences,
+  sortJobsByMatchScore,
+  TOP_MATCHES_LIMIT,
+} from "@/lib/jobs/logic";
+import { salaryPrefsFromPreferences } from "@/lib/jobs/salary-filter";
+import type { CandidateProfile, JobPreferences, Project, Resume } from "@/lib/types/database";
+import type { JobRecord, UserJobState } from "@/lib/types/jobs";
 
 async function loadDashboardData(userId: string) {
   const supabase = await createClient();
 
-  const [profileRes, resumesRes, projectsRes, prefsRes, jobsRes] = await Promise.all([
+  const [profileRes, resumesRes, projectsRes, prefsRes, jobsRes, statesRes] = await Promise.all([
     supabase.from("candidate_profiles").select("*").eq("user_id", userId).maybeSingle(),
     supabase.from("resumes").select("*").eq("user_id", userId).order("updated_at", { ascending: false }),
     supabase.from("projects").select("*").eq("user_id", userId),
     supabase.from("job_preferences").select("*").eq("user_id", userId).maybeSingle(),
     supabase
       .from("jobs")
-      .select("id, title, company, location, description, job_url, match_score, fit_reason, status, last_seen_at")
+      .select(
+        "id, job_hash, title, company, location, description, job_url, salary_min, salary_max, posted_date, match_score, fit_reason, last_seen_at",
+      )
       .order("match_score", { ascending: false, nullsFirst: false })
-      .limit(5),
+      .limit(200),
+    supabase.from("user_job_states").select("*").eq("user_id", userId),
   ]);
+
+  const jobs = (jobsRes.data ?? []) as Omit<JobRecord, "user_state">[];
+  const states = (statesRes.data ?? []) as UserJobState[];
+  const stateMap = new Map(states.map((state) => [state.job_id, state]));
+  const merged: JobRecord[] = jobs.map((job) => ({
+    ...job,
+    user_state: stateMap.get(job.id),
+  }));
+
+  const preferences = (prefsRes.data as JobPreferences | null) ?? null;
+  const excludedKeywords = (preferences?.excluded_keywords ?? [])
+    .map((k) => k.trim())
+    .filter(Boolean);
+  const salaryPrefs = salaryPrefsFromPreferences(preferences);
+  const locationPrefs = locationPrefsFromPreferences(preferences);
+  const listingAgePrefs = {
+    maxAgeDays: preferences?.posted_within_days ?? DEFAULT_POSTED_WITHIN_DAYS,
+    includeOlder: false,
+  };
+  const topMatches = sortJobsByMatchScore(
+    merged.filter((job) =>
+      isDashboardTopMatch(
+        job,
+        excludedKeywords,
+        salaryPrefs,
+        preferences?.max_preferred_experience_years ?? null,
+        locationPrefs,
+        listingAgePrefs,
+      ),
+    ),
+  ).slice(0, TOP_MATCHES_LIMIT);
+
+  const appliedAtTimestamps = states
+    .filter((state) => state.status === "applied" && state.applied_at)
+    .map((state) => state.applied_at as string);
 
   return {
     profile: (profileRes.data as CandidateProfile | null) ?? null,
     resumes: (resumesRes.data as Resume[]) ?? [],
     projects: (projectsRes.data as Project[]) ?? [],
-    preferences: (prefsRes.data as JobPreferences | null) ?? null,
-    recentJobs: (jobsRes.data as JobListing[]) ?? [],
+    preferences,
+    topMatches,
+    appliedAtTimestamps,
   };
 }
 
@@ -44,7 +93,8 @@ export default async function DashboardPage() {
 
   if (!user) return null;
 
-  const { profile, resumes, projects, preferences, recentJobs } = await loadDashboardData(user.id);
+  const { profile, resumes, projects, preferences, topMatches, appliedAtTimestamps } =
+    await loadDashboardData(user.id);
   const completion = profileCompletionPercent(profile);
   const displayName = profile?.full_name || user.email?.split("@")[0] || "there";
 
@@ -52,9 +102,13 @@ export default async function DashboardPage() {
     <div>
       <PageHeader
         title={`Welcome back, ${displayName}`}
-        description="Your job search command center."
+        description="Track applications, hit your daily goal, and jump into top matches."
         action={<RunSearchButton />}
       />
+
+      <div className="mb-8">
+        <ApplicationDashboard appliedAtTimestamps={appliedAtTimestamps} />
+      </div>
 
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
         <Card>
@@ -105,15 +159,17 @@ export default async function DashboardPage() {
         <Card className="xl:col-span-2">
           <CardHeader>
             <CardTitle>Top matches</CardTitle>
-            <CardDescription>Highest-scoring jobs from your pipeline.</CardDescription>
+            <CardDescription>
+              Highest-scoring jobs within your commute range (up to {TOP_MATCHES_LIMIT}).
+            </CardDescription>
           </CardHeader>
-          {recentJobs.length === 0 ? (
+          {topMatches.length === 0 ? (
             <div className="rounded-lg border border-dashed border-border bg-zinc-50 px-4 py-10 text-center text-sm text-muted">
-              No jobs yet. Queue a search from the Jobs page.
+              No jobs yet. Set your home zip in Job Preferences, then queue a search.
             </div>
           ) : (
             <div className="space-y-3">
-              {recentJobs.map((job) => (
+              {topMatches.map((job) => (
                 <Link
                   key={job.id}
                   href={`/jobs?job=${job.id}`}
@@ -123,11 +179,15 @@ export default async function DashboardPage() {
                     <p className="truncate font-medium">{job.title}</p>
                     <p className="truncate text-sm text-muted">
                       {job.company} ·{" "}
-                      {formatWorkLocationLine({
-                        title: job.title,
-                        location: job.location,
-                        description: job.description,
-                      })}
+                      {formatWorkLocationLine(
+                        {
+                          title: job.title,
+                          location: job.location,
+                          description: job.description,
+                        },
+                        job.user_state?.commute_miles,
+                        job.user_state?.work_arrangement,
+                      )}
                     </p>
                   </div>
                   <div className="shrink-0 text-right">

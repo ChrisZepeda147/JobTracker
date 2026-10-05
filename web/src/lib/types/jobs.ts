@@ -29,6 +29,14 @@ export type UserJobState = {
   applied_at: string | null;
   skip_reason: SkipReasonId | null;
   user_notes: string;
+  commute_miles: number | null;
+  work_arrangement: "remote" | "hybrid" | "onsite" | "unknown" | null;
+  location_status: "pass" | "rejected" | "unverified" | null;
+  salary_status: "pass" | "rejected" | "unknown" | null;
+  keyword_status: "pass" | "rejected" | null;
+  experience_status: "pass" | "rejected" | "unknown" | null;
+  education_status: "pass" | "rejected" | null;
+  is_stretch: boolean | null;
   created_at: string;
   updated_at: string;
 };
@@ -50,6 +58,8 @@ export type JobSearchRequest = {
   sources: string[];
   status: "pending" | "running" | "completed" | "failed";
   rescore_only?: boolean;
+  refilter_only?: boolean;
+  nationwide_remote?: boolean;
   jobs_found: number;
   new_jobs_found: number;
   error: string | null;

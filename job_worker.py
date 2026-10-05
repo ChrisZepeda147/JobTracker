@@ -10,7 +10,7 @@ import sys
 import time
 
 from job_engine.database import DatabaseError, JobDatabase
-from job_engine.search_worker import process_search_request, rescore_all_stored_jobs
+from job_engine.search_worker import process_search_request, refilter_user_job_locations, rescore_all_stored_jobs
 
 log = logging.getLogger("worker")
 _shutdown = False
@@ -29,8 +29,20 @@ def setup_logging(verbose: bool) -> None:
         handlers=[logging.StreamHandler(sys.stdout)],
         force=True,
     )
-    for noisy in ("httpx", "httpcore", "google_genai", "groq", "cohere", "hpack", "urllib3", "job_engine"):
-        logging.getLogger(noisy).setLevel(logging.WARNING)
+    for noisy in (
+        "httpx",
+        "httpcore",
+        "google_genai",
+        "groq",
+        "cohere",
+        "hpack",
+        "urllib3",
+        "job_engine",
+        "geopy",
+    ):
+        logging.getLogger(noisy).setLevel(logging.ERROR)
+    for salary_log in ("job_engine.salary_enrichment", "job_engine.salary_filter"):
+        logging.getLogger(salary_log).setLevel(logging.INFO)
 
 
 def _handle_signal(signum, frame) -> None:
@@ -88,6 +100,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Re-score all stored jobs with the local scorer (optional user UUID)",
     )
     parser.add_argument(
+        "--refilter-locations",
+        nargs="?",
+        const="__auto__",
+        metavar="USER_ID",
+        help="Re-filter stored jobs by commute distance (optional user UUID)",
+    )
+    parser.add_argument(
         "--poll",
         type=float,
         default=8.0,
@@ -109,6 +128,17 @@ def main(argv: list[str] | None = None) -> int:
     except DatabaseError as exc:
         log.error("%s", exc)
         return 1
+
+    if args.refilter_locations is not None:
+        user_id = None if args.refilter_locations == "__auto__" else str(args.refilter_locations).strip()
+        if not user_id:
+            user_id = database.load_primary_user_id()
+        if not user_id:
+            log.error("No user id found. Pass --refilter-locations USER_ID explicitly.")
+            return 1
+        updated = refilter_user_job_locations(database, user_id)
+        log.info("[DONE] Refiltered %s stored job(s)", updated)
+        return 0
 
     if args.rescore_all is not None:
         user_id = None if args.rescore_all == "__auto__" else str(args.rescore_all).strip()

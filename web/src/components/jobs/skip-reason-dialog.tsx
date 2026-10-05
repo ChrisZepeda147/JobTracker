@@ -15,7 +15,7 @@ export function SkipReasonDialog({ jobTitle, onConfirm, onCancel }: SkipReasonDi
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 px-4">
       <div className="w-full max-w-md rounded-xl border border-border bg-white p-6 shadow-lg">
-        <h3 className="text-base font-semibold">Why skip this job?</h3>
+        <h3 className="text-base font-semibold">Not a fit — why skip?</h3>
         <p className="mt-1 text-sm text-muted line-clamp-2">{jobTitle}</p>
         <form
           className="mt-4 space-y-4"

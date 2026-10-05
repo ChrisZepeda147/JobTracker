@@ -25,6 +25,7 @@ function statusVariant(status: JobSearchRequest["status"]): "default" | "accent"
 
 function titleSummary(request: JobSearchRequest) {
   if (request.rescore_only) return "Rescore existing jobs";
+  if (request.refilter_only) return "Apply location filter";
   const titles = request.titles?.length ? request.titles : request.query ? [request.query] : [];
   if (titles.length === 0) return "Job search";
   if (titles.length === 1) return titles[0];
@@ -85,7 +86,9 @@ export function JobSearchHistory({ requests, loading }: JobSearchHistoryProps) {
                     <span>
                       {request.rescore_only
                         ? `${request.new_jobs_found} job(s) rescored`
-                        : `${request.new_jobs_found} new · ${request.jobs_found} valid total`}
+                        : request.refilter_only
+                          ? `${request.jobs_found} job(s) location-filtered`
+                          : `${request.new_jobs_found} new · ${request.jobs_found} valid total`}
                     </span>
                   ) : null}
                   {request.status === "failed" && request.error ? (

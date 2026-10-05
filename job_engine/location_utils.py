@@ -11,6 +11,22 @@ from functools import lru_cache
 logger = logging.getLogger("job_engine.location_utils")
 
 _ZIP_RE = re.compile(r"\b(\d{5})(?:-\d{4})?\b")
+_STATE_ABBR_RE = re.compile(
+    r",\s*(AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|"
+    r"MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY|DC)\b"
+)
+_CITY_STATE_RE = re.compile(
+    r"^\s*(?P<city>[^,|;/]+?)\s*,\s*"
+    r"(?P<state>AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|"
+    r"MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY|DC)\b",
+    re.IGNORECASE,
+)
+
+# Used when a job is clearly in another state than the user's home zip — avoids
+# Nominatim calls for nationwide scrape results (Miami, Seattle, etc.).
+_CROSS_STATE_COMMUTE_MILES = 9999.0
+
+_nominatim_geocode = None
 
 
 @dataclass(frozen=True)
@@ -37,6 +53,15 @@ def _normalize_zip(value: str | None) -> str | None:
     if len(digits) >= 5:
         return digits[:5]
     return None
+
+
+def state_abbr_from_location(location: str) -> str | None:
+    match = _STATE_ABBR_RE.search(location or "")
+    return match.group(1).upper() if match else None
+
+
+def _state_abbr_from_location(location: str) -> str | None:
+    return state_abbr_from_location(location)
 
 
 @lru_cache(maxsize=256)
@@ -74,7 +99,62 @@ def scraper_location(location: str, location_zip: str | None) -> str:
     return (location or "").strip() or "United States"
 
 
-@lru_cache(maxsize=512)
+@lru_cache(maxsize=2048)
+def _geocode_us_city_state(city: str, state: str) -> tuple[float, float] | None:
+    """Offline lat/lon from USPS place names (pgeocode), no HTTP."""
+    city_key = city.strip().lower()
+    state_key = state.strip().upper()
+    if not city_key or not state_key:
+        return None
+    try:
+        import pgeocode
+
+        df = pgeocode.Nominatim("us")._data
+        subset = df[
+            (df.state_code == state_key) & (df.place_name.str.lower() == city_key)
+        ]
+        if subset.empty:
+            subset = df[
+                (df.state_code == state_key)
+                & (df.place_name.str.lower().str.startswith(city_key[: min(len(city_key), 24)]))
+            ]
+        if subset.empty:
+            return None
+        row = subset.iloc[0]
+        lat = float(row.latitude)
+        lon = float(row.longitude)
+        if math.isnan(lat) or math.isnan(lon):
+            return None
+        return lat, lon
+    except Exception:
+        logger.debug("City/state lookup failed for %r, %r", city, state, exc_info=True)
+        return None
+
+
+def _nominatim_lookup(normalized: str) -> tuple[float, float] | None:
+    global _nominatim_geocode
+    try:
+        from geopy.geocoders import Nominatim
+        from geopy.extra.rate_limiter import RateLimiter
+
+        if _nominatim_geocode is None:
+            geolocator = Nominatim(user_agent="jobtracker-worker/1.0", timeout=10)
+            _nominatim_geocode = RateLimiter(
+                geolocator.geocode,
+                min_delay_seconds=2.0,
+                max_retries=0,
+                swallow_exceptions=True,
+                return_value_on_exception=None,
+            )
+        result = _nominatim_geocode(f"{normalized}, USA")
+        if result:
+            return result.latitude, result.longitude
+    except Exception:
+        logger.debug("Geocode failed for %r", normalized, exc_info=True)
+    return None
+
+
+@lru_cache(maxsize=2048)
 def _geocode_location(location: str) -> tuple[float, float] | None:
     normalized = (location or "").strip()
     if not normalized:
@@ -86,18 +166,13 @@ def _geocode_location(location: str) -> tuple[float, float] | None:
         if info:
             return info.latitude, info.longitude
 
-    try:
-        from geopy.geocoders import Nominatim
-        from geopy.extra.rate_limiter import RateLimiter
+    city_state = _CITY_STATE_RE.match(normalized)
+    if city_state:
+        coords = _geocode_us_city_state(city_state.group("city"), city_state.group("state"))
+        if coords:
+            return coords
 
-        geolocator = Nominatim(user_agent="jobtracker-worker/1.0")
-        geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1.0)
-        result = geocode(f"{normalized}, USA")
-        if result:
-            return result.latitude, result.longitude
-    except Exception:
-        logger.debug("Geocode failed for %r", normalized, exc_info=True)
-    return None
+    return _nominatim_lookup(normalized)
 
 
 def haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -111,6 +186,11 @@ def haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float
 
 def distance_from_origin(origin: ZipInfo, job_location: str) -> float | None:
     """Return miles from origin zip to a job location, or None if unknown."""
+    job_state = _state_abbr_from_location(job_location)
+    origin_state = (origin.state or "").strip().upper()
+    if job_state and origin_state and job_state != origin_state:
+        return _CROSS_STATE_COMMUTE_MILES
+
     coords = _geocode_location(job_location)
     if not coords:
         return None

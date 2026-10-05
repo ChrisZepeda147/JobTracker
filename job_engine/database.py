@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Iterator, Sequence
 
 from job_engine.models import RawJob
@@ -547,8 +547,34 @@ class JobDatabase:
     # Search worker: requests + user job state
     # ---------------------------------------------------------------
 
+    def _requeue_stale_running_requests(self, max_age_minutes: int = 10) -> None:
+        """Return abandoned running requests to pending so a new worker can pick them up."""
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=max_age_minutes)).isoformat()
+        try:
+            stale = (
+                self.client.table("job_search_requests")
+                .select("id, started_at")
+                .eq("status", "running")
+                .execute()
+            )
+            for row in stale.data or []:
+                started = row.get("started_at")
+                if started and started >= cutoff:
+                    continue
+                self.client.table("job_search_requests").update(
+                    {
+                        "status": "pending",
+                        "started_at": None,
+                        "error": "Re-queued after the previous worker stopped mid-search",
+                    }
+                ).eq("id", row["id"]).eq("status", "running").execute()
+                logger.info("Re-queued stale search request %s", str(row["id"])[:8])
+        except Exception:
+            logger.exception("Failed to requeue stale search requests")
+
     def claim_pending_search_request(self) -> dict[str, Any] | None:
         """Atomically claim the oldest pending search request."""
+        self._requeue_stale_running_requests()
         now = datetime.now(timezone.utc).isoformat()
         try:
             pending = (
@@ -778,6 +804,24 @@ class JobDatabase:
             logger.exception("Failed to load user_job_states for %s", user_id)
             return {}
 
+    def load_stored_salaries_by_hashes(self, hashes: Sequence[str]) -> dict[str, dict[str, Any]]:
+        """Return stored salary fields keyed by job_hash."""
+        found: dict[str, dict[str, Any]] = {}
+        for batch in _chunks(list(hashes), HASH_QUERY_CHUNK):
+            try:
+                response = (
+                    self.client.table("jobs")
+                    .select("job_hash, salary_min, salary_max")
+                    .in_("job_hash", list(batch))
+                    .execute()
+                )
+                for row in response.data or []:
+                    if row.get("salary_min") is not None or row.get("salary_max") is not None:
+                        found[row["job_hash"]] = row
+            except Exception:
+                logger.exception("Stored salary lookup failed for batch of %s", len(batch))
+        return found
+
     def load_stored_jobs_by_hashes(self, hashes: Sequence[str]) -> dict[str, dict[str, Any]]:
         """Return stored job rows keyed by job_hash (for score reuse)."""
         found: dict[str, dict[str, Any]] = {}
@@ -798,28 +842,144 @@ class JobDatabase:
                 logger.exception("Stored job lookup failed for batch of %s", len(batch))
         return found
 
-    def ensure_user_job_states(self, user_id: str, job_ids: Sequence[str], known_job_ids: set[str]) -> int:
-        """Create status=new rows for jobs the user has never seen. Never overwrite."""
+    def ensure_user_job_states(
+        self,
+        user_id: str,
+        job_ids: Sequence[str],
+        known_job_ids: set[str],
+        location_by_job: dict[str, dict[str, Any]] | None = None,
+    ) -> int:
+        """Create status=new rows for jobs the user has never seen. Never overwrite status."""
         created = 0
+        location_by_job = location_by_job or {}
         for job_id in job_ids:
+            location = location_by_job.get(job_id) or {}
             if job_id in known_job_ids:
+                if location:
+                    self._patch_user_job_location(user_id, job_id, location)
                 continue
+            payload: dict[str, Any] = {"user_id": user_id, "job_id": job_id, "status": "new"}
+            payload.update(location)
             try:
                 response = (
                     self.client.table("user_job_states")
-                    .insert({"user_id": user_id, "job_id": job_id, "status": "new"})
+                    .insert(payload)
                     .execute()
                 )
                 if response.data:
                     created += 1
                     known_job_ids.add(job_id)
             except Exception as exc:
-                # Unique violation means another worker got there first — safe to ignore.
                 if "duplicate" in str(exc).lower() or "23505" in str(exc):
                     known_job_ids.add(job_id)
+                    if location:
+                        self._patch_user_job_location(user_id, job_id, location)
                     continue
                 logger.exception("Failed to create user_job_state for job %s", job_id)
         return created
+
+    def _patch_user_job_location(self, user_id: str, job_id: str, location: dict[str, Any]) -> None:
+        patch = {
+            k: location[k]
+            for k in (
+                "commute_miles",
+                "work_arrangement",
+                "location_status",
+                "salary_status",
+                "keyword_status",
+                "experience_status",
+                "education_status",
+            )
+            if k in location
+        }
+        if not patch:
+            return
+        try:
+            self.client.table("user_job_states").update(patch).eq("user_id", user_id).eq("job_id", job_id).execute()
+        except Exception:
+            logger.exception("Failed to patch filter state for user %s job %s", user_id, job_id)
+
+    def upsert_user_job_filter_states(self, user_id: str, updates: list[dict[str, Any]]) -> int:
+        """Write location and salary verdicts for stored jobs (refilter pass)."""
+        written = 0
+        for row in updates:
+            job_id = str(row["job_id"])
+            payload = {
+                "commute_miles": row.get("commute_miles"),
+                "work_arrangement": row.get("work_arrangement"),
+                "location_status": row.get("location_status"),
+                "salary_status": row.get("salary_status"),
+                "keyword_status": row.get("keyword_status"),
+                "experience_status": row.get("experience_status"),
+                "education_status": row.get("education_status"),
+                "is_stretch": row.get("is_stretch"),
+            }
+            try:
+                response = (
+                    self.client.table("user_job_states")
+                    .select("job_id")
+                    .eq("user_id", user_id)
+                    .eq("job_id", job_id)
+                    .limit(1)
+                    .execute()
+                )
+                if response.data:
+                    self.client.table("user_job_states").update(payload).eq("user_id", user_id).eq("job_id", job_id).execute()
+                else:
+                    self.client.table("user_job_states").insert(
+                        {"user_id": user_id, "job_id": job_id, "status": "new", **payload}
+                    ).execute()
+                written += 1
+            except Exception:
+                logger.exception("Failed to upsert filter state for job %s", job_id)
+        return written
+
+    def upsert_user_job_location_states(self, user_id: str, updates: list[dict[str, Any]]) -> int:
+        """Backward-compatible alias for filter-state upserts."""
+        return self.upsert_user_job_filter_states(user_id, updates)
+
+    def update_job_salaries(self, jobs: Iterable[RawJob]) -> int:
+        """Persist salary discovered from posting pages onto global job rows."""
+        updated = 0
+        for job in jobs:
+            if job.salary_min is None and job.salary_max is None:
+                continue
+            if not job.normalized_url_hash:
+                continue
+            try:
+                response = (
+                    self.client.table("jobs")
+                    .update({"salary_min": job.salary_min, "salary_max": job.salary_max})
+                    .eq("job_hash", job.normalized_url_hash)
+                    .execute()
+                )
+                if response.data:
+                    updated += 1
+            except Exception:
+                logger.exception("Failed to update salary for job hash %s", job.normalized_url_hash)
+        return updated
+
+    def update_job_experience_requirements(self, jobs: Iterable[RawJob]) -> int:
+        """Persist extracted experience requirements onto global job rows."""
+        updated = 0
+        for job in jobs:
+            if not job.experience_requirement or not job.normalized_url_hash:
+                continue
+            try:
+                response = (
+                    self.client.table("jobs")
+                    .update({"experience_requirement": job.experience_requirement})
+                    .eq("job_hash", job.normalized_url_hash)
+                    .execute()
+                )
+                if response.data:
+                    updated += 1
+            except Exception:
+                logger.exception(
+                    "Failed to update experience requirement for job hash %s",
+                    job.normalized_url_hash,
+                )
+        return updated
 
     def job_ids_for_hashes(self, hashes: Sequence[str]) -> dict[str, str]:
         """Map job_hash -> jobs.id for linking user state."""

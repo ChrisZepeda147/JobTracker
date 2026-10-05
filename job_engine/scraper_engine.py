@@ -13,8 +13,11 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterator
 from urllib.parse import quote_plus, urljoin
 
+from job_engine.config import get_settings
+from job_engine.greenhouse_boards import fetch_greenhouse_jobs
 from job_engine.models import RawJob
 from job_engine.normalizer import annualize_salary, infer_interval_from_amount
+from job_engine.wellfound_scraper import fetch_wellfound_jobs
 
 logger = logging.getLogger("job_engine.scraper")
 
@@ -261,6 +264,8 @@ def _compose_location(row: dict[str, Any]) -> str:
 
     if "hybrid" in wfh:
         return f"Hybrid - {base}" if base else "Hybrid"
+    if any(token in wfh for token in ("on-site", "onsite", "on site", "in office", "in-office")):
+        return f"On-site - {base}" if base else "On-site"
     if wfh in {"remote", "fully remote", "work from home"}:
         return f"Remote - {base}" if base else "Remote"
     if is_remote is True and broad:
@@ -399,9 +404,39 @@ class ScraperEngine:
     ) -> list[RawJob]:
         if site == "builtin":
             return self._scrape_builtin(search_term, location, is_remote, results_wanted, hours_old)
+        if site == "company_career_pages":
+            return self._scrape_company_career_pages(
+                search_term, is_remote, results_wanted
+            )
+        if site == "wellfound":
+            return self._scrape_wellfound(search_term, results_wanted)
         if site in JOBSPY_SITES:
             return self._scrape_jobspy(site, search_term, location, is_remote, results_wanted, hours_old)
         raise ScraperError(f"Unsupported job board: {site}")
+
+    def _scrape_company_career_pages(
+        self,
+        search_term: str,
+        is_remote: bool,
+        results_wanted: int,
+    ) -> list[RawJob]:
+        settings = get_settings()
+        return fetch_greenhouse_jobs(
+            search_term=search_term,
+            is_remote=is_remote,
+            results_wanted=results_wanted,
+            board_slugs=settings.greenhouse_board_slugs,
+            http_get=self._request,
+        )
+
+    def _scrape_wellfound(self, search_term: str, results_wanted: int) -> list[RawJob]:
+        settings = get_settings()
+        return fetch_wellfound_jobs(
+            search_term=search_term,
+            results_wanted=results_wanted,
+            http_get=self._request,
+            api_key=settings.wellfound_api_key,
+        )
 
     def _with_retries(self, site: str, operation: Callable[[], list[RawJob]]) -> list[RawJob]:
         last_error: BaseException | None = None

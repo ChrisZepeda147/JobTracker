@@ -10,9 +10,9 @@ UI_SOURCE_TO_SCRAPER: dict[str, str | None] = {
     "linkedin": "linkedin",
     "indeed": "indeed",
     "zip_recruiter": "zip_recruiter",
-    "wellfound": None,
+    "wellfound": "wellfound",
     "builtin": "builtin",
-    "company_career_pages": None,
+    "company_career_pages": "company_career_pages",
 }
 
 SCRAPER_TO_UI: dict[str, str] = {
@@ -21,6 +21,8 @@ SCRAPER_TO_UI: dict[str, str] = {
     "zip_recruiter": "zip_recruiter",
     "builtin": "builtin",
     "glassdoor": "glassdoor",
+    "wellfound": "wellfound",
+    "company_career_pages": "company_career_pages",
 }
 
 
@@ -45,6 +47,8 @@ class SearchRequest:
     status: str = "pending"
     source_results: dict[str, Any] = field(default_factory=dict)
     rescore_only: bool = False
+    refilter_only: bool = False
+    nationwide_remote: bool = False
 
     @classmethod
     def from_row(cls, row: dict[str, Any]) -> "SearchRequest":
@@ -66,10 +70,12 @@ class SearchRequest:
             status=str(row.get("status") or "pending"),
             source_results=dict(row.get("source_results") or {}),
             rescore_only=bool(row.get("rescore_only", False)),
+            refilter_only=bool(row.get("refilter_only", False)),
+            nationwide_remote=bool(row.get("nationwide_remote", False)),
         )
 
     def hours_old(self) -> int:
-        days = self.posted_within_days or 7
+        days = self.posted_within_days or 21
         return max(24, days * 24)
 
     def search_titles(self) -> list[str]:

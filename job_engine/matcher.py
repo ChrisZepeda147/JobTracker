@@ -47,6 +47,27 @@ VALID_LOCATION_PREFERENCES = ("remote", "onsite", "hybrid")
 _REMOTE_RE = re.compile(r"\b(remote|work from home|wfh|distributed|anywhere)\b", re.IGNORECASE)
 _HYBRID_RE = re.compile(r"\bhybrid\b", re.IGNORECASE)
 _ONSITE_RE = re.compile(r"\b(on[- ]?site|in[- ]office|in person)\b", re.IGNORECASE)
+# LinkedIn often puts work mode on its own line above "Full-time" (not in the location field).
+_ARRANGEMENT_LINE_RE = re.compile(
+    r"(?im)^\s*(remote|hybrid|on[- ]?site|onsite|in[- ]?office|in office)\s*$",
+)
+
+
+def _work_mode_from_description_lines(description: str | None) -> str | None:
+    if not description:
+        return None
+    for line in description.splitlines()[:30]:
+        match = _ARRANGEMENT_LINE_RE.match(line.strip())
+        if not match:
+            continue
+        token = match.group(1).lower().replace(" ", "")
+        if token == "remote":
+            return "remote"
+        if token == "hybrid":
+            return "hybrid"
+        if token in {"onsite", "on-site", "inoffice", "in-office"}:
+            return "onsite"
+    return None
 _WORD_RE = re.compile(r"[a-z0-9][a-z0-9+#./-]*", re.IGNORECASE)
 # Terms that look like technologies: capitalised mid-sentence, or containing a
 # digit or symbol (C++, K8s, .NET). Used to keep local "missing skills" useful.
@@ -88,6 +109,36 @@ _JUNIOR_TITLE_RES = (
     re.compile(r"\b(?:swe|sde)\s+(?:i|1)\b", re.IGNORECASE),
     re.compile(r"\b(?:swe|sde)(?:i|1)\b", re.IGNORECASE),
 )
+
+_STRONG_STACK_TERMS = frozenset(
+    """
+    react next.js nextjs typescript javascript node node.js nodejs python postgresql postgres
+    supabase api rest graphql integration integrations automation
+    """.split()
+)
+
+_WEAK_STACK_TERMS = frozenset(
+    """
+    java dotnet .net c# swift kotlin objective-c cobol
+    """.split()
+)
+
+
+def _stack_match_adjustment(title: str, description: str) -> float:
+    """Prefer user's stack in ranking; never a hard filter."""
+    text = f"{title} {description or ''}".lower()
+    boost = 0.0
+    for term in _STRONG_STACK_TERMS:
+        if term in text:
+            boost += 0.025
+    boost = min(boost, 0.12)
+    penalty = 0.0
+    for term in _WEAK_STACK_TERMS:
+        if re.search(rf"\b{re.escape(term)}\b", text):
+            penalty += 0.035
+    penalty = min(penalty, 0.12)
+    return boost - penalty
+
 
 _SENIOR_TITLE_RES = (
     re.compile(r"\bsenior\b", re.IGNORECASE),
@@ -287,6 +338,13 @@ class UserProfile:
     work_location_preference: str = "remote"
     preferred_cities: list[str] = field(default_factory=list)
     blacklisted_companies: list[str] = field(default_factory=list)
+    applied_job_summary: str = ""
+    skipped_job_summary: str = ""
+    applied_titles: list[str] = field(default_factory=list)
+    applied_companies: list[str] = field(default_factory=list)
+    feedback_avoid_locations: list[str] = field(default_factory=list)
+    feedback_avoid_keywords: list[str] = field(default_factory=list)
+    feedback_reject_senior: bool = False
 
     # Optional knobs with safe defaults.
     min_match_score: int = 60
@@ -373,18 +431,24 @@ class FilterVerdict:
 def detect_work_mode(job: RawJob) -> str:
     """Classify a posting as remote, hybrid, onsite, or unknown."""
     location = job.location or ""
-    if _REMOTE_RE.search(location):
-        return "remote"
+    from_lines = _work_mode_from_description_lines(job.description)
+    if from_lines:
+        return from_lines
+
     if _HYBRID_RE.search(location):
         return "hybrid"
+    if _REMOTE_RE.search(location):
+        return "remote"
+    if _ONSITE_RE.search(location):
+        return "onsite"
 
     head = f"{job.title}\n{(job.description or '')[:1500]}"
     if _HYBRID_RE.search(head):
         return "hybrid"
-    if _REMOTE_RE.search(head):
-        return "remote"
     if _ONSITE_RE.search(head):
         return "onsite"
+    if _REMOTE_RE.search(head):
+        return "remote"
     return "unknown"
 
 
@@ -565,6 +629,22 @@ def build_prompt(job: RawJob, profile: UserProfile) -> str:
     resume = (profile.resume_text or "(no resume provided)")[:MAX_RESUME_CHARS]
     description = (job.description or "(no description provided)")[:MAX_DESCRIPTION_CHARS]
 
+    feedback_blocks = ""
+    if profile.applied_job_summary.strip():
+        feedback_blocks += f"""
+<jobs_user_applied_to>
+These are positive signals — the candidate applied because these looked like a good fit:
+{profile.applied_job_summary.strip()}
+</jobs_user_applied_to>
+"""
+    if profile.skipped_job_summary.strip():
+        feedback_blocks += f"""
+<jobs_user_skipped>
+The candidate skipped these — penalize similar postings and respect the stated reasons:
+{profile.skipped_job_summary.strip()}
+</jobs_user_skipped>
+"""
+
     return f"""<candidate_resume>
 {resume}
 </candidate_resume>
@@ -575,7 +655,7 @@ Minimum salary: ${profile.min_salary:,.0f}
 Work location preference: {profile.work_location_preference}
 Preferred cities: {", ".join(profile.preferred_cities) or "not specified"}
 </candidate_preferences>
-
+{feedback_blocks}
 <job_posting>
 Title: {job.title}
 Company: {job.company or "unknown"}
@@ -687,6 +767,15 @@ class LocalTfidfScorer(BaseScorer):
 
         junior_adj = _junior_title_adjustment(job.title or "")
         senior_adj = _senior_title_adjustment(job.title or "")
+        stack_adj = _stack_match_adjustment(job.title or "", job.description or "")
+
+        feedback_adj = 0.0
+        try:
+            from job_engine.job_feedback import feedback_score_adjustment
+
+            feedback_adj = feedback_score_adjustment(job, profile)
+        except Exception:
+            logger.debug("Feedback score adjustment skipped", exc_info=True)
 
         raw = (
             0.30 * title_overlap
@@ -695,6 +784,8 @@ class LocalTfidfScorer(BaseScorer):
             + 0.10 * salary_headroom
             + junior_adj
             + senior_adj
+            + stack_adj
+            + feedback_adj
         )
         score = max(0, min(100, int(round(raw * 100))))
 

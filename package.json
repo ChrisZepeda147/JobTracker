@@ -8,6 +8,7 @@
     "search:worker": "node scripts/run-worker.mjs",
     "search:once": "node scripts/run-worker.mjs --once",
     "search:rescore": "node scripts/run-worker.mjs --rescore-all",
+    "search:refilter": "node scripts/run-worker.mjs --refilter-locations",
     "build": "npm run build --prefix web",
     "start": "npm run start --prefix web",
     "lint": "npm run lint --prefix web",

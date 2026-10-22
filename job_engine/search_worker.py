@@ -12,15 +12,17 @@ from job_engine.models import RawJob
 from job_engine.normalizer import normalize_jobs
 from job_engine.scraper_engine import RateLimitError, ScraperConfig, ScraperEngine
 from job_engine.location_utils import scraper_location
-from job_engine.education_filter import evaluate_job_education
-from job_engine.experience_filter import evaluate_job_experience, experience_context_from_prefs
-from job_engine.keyword_filter import evaluate_job_keywords
-from job_engine.location_filter import evaluate_job_location, location_context_from_prefs
+from job_engine.filter_stats import SearchFilterStats
+from job_engine.listing_availability import check_job_listing_availability, evaluate_availability_from_fetch
+from job_engine.posting_fetch import get_cached_posting, set_fetch_budget
+from job_engine.posting_hydration import HydrationStats, hydrate_job_postings
 from job_engine.salary_enrichment import enrich_jobs_salaries
-from job_engine.salary_filter import evaluate_job_salary, salary_context_from_prefs, SalaryContext
-from job_engine.salary_resolver import set_fetch_budget
+from job_engine.salary_filter import salary_context_from_prefs, SalaryContext
 from job_engine.stretch import compute_is_stretch
+from job_engine.rejection_audit import RejectionAudit
 from job_engine.search_filters import SearchRequestFilter
+
+_RECOMMENDED_MIN_SCORE = 75
 from job_engine.search_models import SCRAPER_TO_UI, SearchRequest
 from job_engine.user_context import load_user_rescore_profile, load_user_search_context
 
@@ -91,6 +93,8 @@ def scrape_by_source(
     request: SearchRequest,
     scraper_sites: list[str],
     source_results: dict[str, dict[str, Any]],
+    *,
+    linkedin_fetch_description: bool = False,
 ) -> list[RawJob]:
     """Scrape each board for every selected title; failures are isolated per call."""
     collected: list[RawJob] = []
@@ -110,6 +114,7 @@ def scrape_by_source(
         is_remote=is_remote,
         results_wanted=per_query,
         hours_old=request.hours_old(),
+        linkedin_fetch_description=linkedin_fetch_description,
     )
     engine = ScraperEngine(config)
 
@@ -163,8 +168,55 @@ def _filter_payload(job: RawJob) -> dict[str, Any]:
         "keyword_status": job.keyword_status or "pass",
         "experience_status": job.experience_status or "pass",
         "education_status": job.education_status or "pass",
+        "management_status": getattr(job, "management_status", None) or "pass",
+        "seniority_status": getattr(job, "seniority_status", None) or "pass",
+        "listing_status": getattr(job, "listing_status", None),
+        "listing_check_reason": getattr(job, "listing_check_reason", None),
+        "listing_checked_at": getattr(job, "listing_checked_at", None),
+        "filter_reason": getattr(job, "filter_reason", None),
         "is_stretch": bool(getattr(job, "is_stretch", False)),
     }
+
+
+def _apply_listing_availability(
+    jobs: list[RawJob],
+    *,
+    strict: bool,
+    stats: SearchFilterStats,
+    max_checks: int,
+) -> list[RawJob]:
+    """Validate listing URLs for the candidate pool; drop closed listings in strict mode."""
+    kept: list[RawJob] = []
+    checks = 0
+    for job in jobs:
+        if max_checks is not None and checks >= max_checks and not get_cached_posting(job.job_url or ""):
+            job.listing_status = job.listing_status or "unknown"
+            job.listing_check_reason = job.listing_check_reason or "availability check budget exhausted"
+            stats.listing_availability_unknown += 1
+            kept.append(job)
+            continue
+
+        cached = get_cached_posting(job.job_url or "")
+        if cached is not None:
+            availability = evaluate_availability_from_fetch(cached)
+        else:
+            checks += 1
+            availability = check_job_listing_availability(job.job_url, reuse_cache=True)
+
+        job.listing_status = availability.status
+        job.listing_check_reason = availability.reason
+        job.listing_checked_at = availability.checked_at
+
+        if availability.status == "closed":
+            stats.closed_rejected += 1
+            job.filter_reason = job.filter_reason or f"listing closed: {availability.reason}"
+            if strict:
+                continue
+        elif availability.status == "unknown":
+            stats.listing_availability_unknown += 1
+
+        kept.append(job)
+    return kept
 
 
 def _apply_stretch_flags(
@@ -174,6 +226,28 @@ def _apply_stretch_flags(
 ) -> None:
     for job in jobs:
         job.is_stretch = compute_is_stretch(job, salary_ctx, max_preferred_years)
+
+
+def _sync_hydration_stats(stats: SearchFilterStats, hydration: HydrationStats) -> None:
+    stats.hydration_attempted = hydration.attempted
+    stats.hydration_success = hydration.hydrated
+    stats.hydration_failed = hydration.failed
+    stats.description_hydrated = hydration.hydrated
+    stats.description_hydration_failed = hydration.failed
+    for domain, count in hydration.failed_by_domain.items():
+        stats.hydration_failed_by_domain[domain] = stats.hydration_failed_by_domain.get(domain, 0) + count
+
+
+def _finalize_survivor_stats(stats: SearchFilterStats, survivors: list[RawJob]) -> None:
+    stats.final_saved = len(survivors)
+    stats.needs_decision_count = sum(1 for job in survivors if job.experience_status == "unknown")
+    stats.recommended_count = sum(
+        1
+        for job in survivors
+        if (job.match_score or 0) >= _RECOMMENDED_MIN_SCORE and job.experience_status != "unknown"
+    )
+    scores = [int(job.match_score) for job in survivors if job.match_score is not None]
+    stats.record_scores(scores)
 
 
 def _filter_by_job_id(jobs: list[RawJob], hash_to_id: dict[str, str]) -> dict[str, dict[str, Any]]:
@@ -186,95 +260,67 @@ def _filter_by_job_id(jobs: list[RawJob], hash_to_id: dict[str, str]) -> dict[st
 
 
 def refilter_user_job_filters(database: JobDatabase, user_id: str) -> int:
-    """Re-evaluate location and salary hard filters for every stored job."""
-    set_fetch_budget(None)
+    """Re-evaluate hard filters for every stored job (strict rules from preferences)."""
+    settings = get_settings()
     prefs = database.load_job_preferences(user_id)
-    location_ctx = location_context_from_prefs(prefs)
-    salary_ctx = salary_context_from_prefs(prefs)
-    experience_ctx = experience_context_from_prefs(prefs)
+    strict = bool((prefs or {}).get("strict_filtering", True))
+    stats = SearchFilterStats()
+
+    set_fetch_budget(settings.strict_hydration_budget + settings.strict_availability_budget)
     jobs = database.load_all_jobs()
     if not jobs:
         log.info("[FILTER] No stored jobs to refilter")
         return 0
 
+    if strict:
+        hydration = hydrate_job_postings(
+            jobs,
+            max_fetches=settings.strict_hydration_budget,
+            stats=HydrationStats(),
+        )
+        _sync_hydration_stats(stats, hydration)
+        database.update_job_descriptions(jobs)
+
     salary_enriched = enrich_jobs_salaries(jobs, database=database)
     if salary_enriched:
         log.info("[SALARY] Backfill enriched %s job(s) from posting pages", salary_enriched)
 
+    synthetic = SearchRequest.synthetic_refilter(user_id, prefs)
+    ctx = load_user_search_context(database, user_id, synthetic)
+    audit = RejectionAudit()
+    hard_filter = SearchRequestFilter(ctx, database=database, stats=stats, audit=audit)
+    salary_ctx = salary_context_from_prefs(prefs)
+
     hash_to_id = database.job_ids_for_hashes([job.normalized_url_hash for job in jobs])
     updates: list[dict[str, Any]] = []
-    location_rejected = 0
-    location_unverified = 0
-    salary_rejected = 0
-    salary_unknown = 0
-    keyword_rejected = 0
-    experience_rejected = 0
-    experience_unknown = 0
-    excluded_keywords = list((prefs or {}).get("excluded_keywords") or [])
 
     for job in jobs:
         job_id = hash_to_id.get(job.normalized_url_hash)
         if not job_id:
             continue
-
-        location_result = evaluate_job_location(job, location_ctx)
-        job.commute_miles = location_result.miles
-        job.work_arrangement = location_result.arrangement
-        job.location_status = location_result.status
-        if location_result.status == "rejected":
-            location_rejected += 1
-        elif location_result.status == "unverified":
-            location_unverified += 1
-
-        salary_result = evaluate_job_salary(job, salary_ctx, fetch_page=False, database=database)
-        job.salary_status = salary_result.status
-        if salary_result.status == "rejected":
-            salary_rejected += 1
-        elif salary_result.status == "unknown":
-            salary_unknown += 1
-
-        keyword_result = evaluate_job_keywords(job, excluded_keywords)
-        job.keyword_status = keyword_result.status
-        if keyword_result.status == "rejected":
-            keyword_rejected += 1
-
-        experience_result = evaluate_job_experience(job, experience_ctx)
-        job.experience_status = experience_result.status
-        if experience_result.status == "rejected":
-            experience_rejected += 1
-        elif experience_result.status == "unknown":
-            experience_unknown += 1
-        if experience_result.required_years is not None:
-            from job_engine.experience_filter import format_experience_requirement
-
-            job.experience_requirement = format_experience_requirement(experience_result.required_years)
-
-        education_result = evaluate_job_education(job)
-        job.education_status = education_result.status
-
-        _apply_stretch_flags([job], salary_ctx, experience_ctx.max_preferred_years)
+        hard_filter.evaluate(job)
+        _apply_stretch_flags([job], salary_ctx, ctx.max_preferred_experience_years)
         updates.append({"job_id": job_id, **_filter_payload(job)})
 
     database.update_job_salaries(jobs)
     database.update_job_experience_requirements(jobs)
     written = database.upsert_user_job_filter_states(user_id, updates)
-    log.info(
-        "[FILTER] Refiltered %s job(s): location rejected=%s unverified=%s, salary rejected=%s unknown=%s, keyword rejected=%s, experience rejected=%s unknown=%s",
-        written,
-        location_rejected,
-        location_unverified,
-        salary_rejected,
-        salary_unknown,
-        keyword_rejected,
-        experience_rejected,
-        experience_unknown,
-    )
+    audit.log_samples(log)
+    stats.log_summary(log)
+    log.info("[FILTER] Refiltered %s job(s)", written)
     return written
 
 
 def refilter_user_job_locations(database: JobDatabase, user_id: str) -> int:
     """Backward-compatible alias — refilters location and salary."""
     return refilter_user_job_filters(database, user_id)
+
+
+def reevaluate_all_stored_jobs(database: JobDatabase, user_id: str) -> tuple[int, int]:
+    """Re-run hard filters then re-score all stored jobs for one user."""
+    refiltered = refilter_user_job_filters(database, user_id)
+    rescored = rescore_all_stored_jobs(database, user_id)
+    return refiltered, rescored
 
 
 def process_refilter_request(database: JobDatabase, row: dict[str, Any]) -> None:
@@ -367,9 +413,18 @@ def process_search_request(database: JobDatabase, row: dict[str, Any]) -> None:
     for ui_key, meta in skipped.items():
         log.info("[%s] Skipped (%s)", ui_key.upper(), meta.get("error", "unsupported"))
 
+    prefs_early = database.load_job_preferences(request.user_id)
+    strict = bool((prefs_early or {}).get("strict_filtering", True))
+    stats = SearchFilterStats()
+
     raw_jobs: list[RawJob] = []
     if scraper_sites:
-        raw_jobs = scrape_by_source(request, scraper_sites, source_results)
+        raw_jobs = scrape_by_source(
+            request,
+            scraper_sites,
+            source_results,
+            linkedin_fetch_description=strict,
+        )
     elif skipped:
         database.finish_search_request(
             request.id,
@@ -384,7 +439,9 @@ def process_search_request(database: JobDatabase, row: dict[str, Any]) -> None:
     else:
         log.warning("[SEARCH] No sources selected")
 
+    stats.raw_scraped = len(raw_jobs)
     normalized = normalize_jobs(raw_jobs)
+    stats.normalized = len(normalized)
     log.info("[NORMALIZE] %s raw → %s unique", len(raw_jobs), len(normalized))
 
     settings = get_settings()
@@ -392,18 +449,28 @@ def process_search_request(database: JobDatabase, row: dict[str, Any]) -> None:
     user_suppressed = database.load_user_suppressed_job_hashes(request.user_id)
     database.rules(refresh=True)
 
-    set_fetch_budget(max(settings.search_result_limit * 2, 30))
+    set_fetch_budget(settings.strict_hydration_budget + settings.strict_availability_budget + 10)
+    if strict:
+        hydration = hydrate_job_postings(
+            normalized,
+            max_fetches=settings.strict_hydration_budget,
+            stats=HydrationStats(),
+        )
+        _sync_hydration_stats(stats, hydration)
+
     salary_enriched = enrich_jobs_salaries(normalized, database=database)
     if salary_enriched:
         log.info("[SALARY] Enriched %s job(s) from posting pages", salary_enriched)
     database.update_job_salaries(normalized)
-    set_fetch_budget(None)
 
+    audit = RejectionAudit()
     hard_filter = SearchRequestFilter(
         ctx,
         database=database,
         user_suppressed_hashes=user_suppressed,
         salary_database=database,
+        stats=stats,
+        audit=audit,
     )
     survivors, rejections = hard_filter.apply(normalized)
     log.info("[FILTER] %s unique → %s valid", len(normalized), len(survivors))
@@ -428,18 +495,42 @@ def process_search_request(database: JobDatabase, row: dict[str, Any]) -> None:
         return
 
     result_limit = settings.search_result_limit
+    scoring_buffer = max(result_limit * 2, result_limit)
 
     if survivors:
         local_scorer = build_scorer(ctx.profile, settings, force_local=True)
         survivors = local_scorer.score_jobs(survivors)
         log.info("[SCORE] Local pre-rank on %s filtered job(s)", len(survivors))
+        survivors = _trim_to_top_matches(survivors, scoring_buffer)
+        stats.temporary_scoring_pool = len(survivors)
+        log.info("[SELECT] Scoring pool top %s job(s) (buffer before availability)", len(survivors))
+
+        before_avail = len(survivors)
+        survivors = _apply_listing_availability(
+            survivors,
+            strict=strict,
+            stats=stats,
+            max_checks=settings.strict_availability_budget,
+        )
+        if before_avail != len(survivors):
+            log.info(
+                "[FILTER] listing availability removed %s closed job(s) (%s remain)",
+                before_avail - len(survivors),
+                len(survivors),
+            )
         survivors = _trim_to_top_matches(survivors, result_limit)
-        log.info("[SELECT] Kept top %s job(s) by match score", len(survivors))
+        log.info("[SELECT] Final top %s job(s) after availability", len(survivors))
+        _finalize_survivor_stats(stats, survivors)
+        stats.log_summary(log)
+        audit.log_samples(log)
 
         database.update_job_salaries(survivors)
         database.update_job_experience_requirements(survivors)
+        database.update_job_descriptions(survivors)
         report = database.save_jobs(survivors)
         log.info("[SAVE] %s", report.summary())
+
+    set_fetch_budget(None)
 
     hashes = [job.normalized_url_hash for job in survivors]
     stored = database.load_stored_jobs_by_hashes(hashes)

@@ -10,20 +10,20 @@ import { JobSearchPanel } from "@/components/jobs/job-search-panel";
 import { SkipReasonDialog } from "@/components/jobs/skip-reason-dialog";
 import { DEFAULT_POSTED_WITHIN_DAYS, JOB_TABS, type JobTabId, type SkipReasonId } from "@/lib/jobs/constants";
 import { isListingTooOld } from "@/lib/jobs/listing-age";
+import { fetchUserJobRecords } from "@/lib/jobs/fetch-user-jobs";
 import {
   countForTab,
   defaultsFromPreferences,
   jobMatchesTab,
   locationPrefsFromPreferences,
-  mergeJobsWithStates,
   sortJobsByMatchScore,
   sortJobsForTab,
   type SearchFormDefaults,
   type SearchScope,
 } from "@/lib/jobs/logic";
-import { queueReevaluateStoredJobs } from "@/lib/jobs/maintenance";
+import { reevaluateStoredJobs } from "@/lib/jobs/run-reevaluate";
 import { salaryPrefsFromPreferences } from "@/lib/jobs/salary-filter";
-import type { JobRecord, JobSearchRequest, UserJobState } from "@/lib/types/jobs";
+import type { JobRecord, JobSearchRequest } from "@/lib/types/jobs";
 import type { JobPreferences } from "@/lib/types/database";
 import { cn } from "@/lib/utils/cn";
 
@@ -44,6 +44,7 @@ export function JobsBoard({ userId, preferences, focusJobId = null }: JobsBoardP
   const [skipTarget, setSkipTarget] = useState<JobRecord | null>(null);
   const [highlightedJobId, setHighlightedJobId] = useState<string | null>(null);
   const [includeOlderListings, setIncludeOlderListings] = useState(false);
+  const [reevaluateRunning, setReevaluateRunning] = useState(false);
 
   const searchDefaults = useMemo(() => defaultsFromPreferences(preferences), [preferences]);
   const excludedKeywords = useMemo(
@@ -101,35 +102,12 @@ export function JobsBoard({ userId, preferences, focusJobId = null }: JobsBoardP
   const loadJobs = useCallback(async () => {
     setError(null);
     const supabase = createClient();
-
-    const [jobsRes, statesRes] = await Promise.all([
-      supabase
-        .from("jobs")
-        .select(
-          "id, job_hash, title, company, location, job_url, description, site, salary_min, salary_max, posted_date, match_score, fit_reason, missing_skills, experience_requirement, scored_by, last_seen_at",
-        )
-        .order("last_seen_at", { ascending: false })
-        .limit(200),
-      supabase.from("user_job_states").select("*").eq("user_id", userId),
-    ]);
-
-    if (jobsRes.error) {
-      setError(jobsRes.error.message);
-      setLoading(false);
-      return;
+    const { jobs, error: loadError } = await fetchUserJobRecords(supabase, userId);
+    if (loadError) {
+      setError(loadError);
+    } else {
+      setJobs(jobs);
     }
-    if (statesRes.error) {
-      setError(statesRes.error.message);
-      setLoading(false);
-      return;
-    }
-
-    setJobs(
-      mergeJobsWithStates(
-        (jobsRes.data ?? []) as Omit<JobRecord, "user_state">[],
-        (statesRes.data ?? []) as UserJobState[],
-      ),
-    );
     setLoading(false);
   }, [userId]);
 
@@ -167,6 +145,7 @@ export function JobsBoard({ userId, preferences, focusJobId = null }: JobsBoardP
           maxPreferredExperienceYears,
           locationPrefs,
           listingAgePrefs,
+          preferences,
         )
       ) {
         setActiveTab(tab.id);
@@ -220,6 +199,7 @@ export function JobsBoard({ userId, preferences, focusJobId = null }: JobsBoardP
             maxPreferredExperienceYears,
             locationPrefs,
             listingAgePrefs,
+            preferences,
           ),
         ),
         activeTab,
@@ -234,6 +214,7 @@ export function JobsBoard({ userId, preferences, focusJobId = null }: JobsBoardP
       locationPrefs,
       listingAgePrefs,
       pinJobId,
+      preferences,
     ],
   );
 
@@ -250,10 +231,11 @@ export function JobsBoard({ userId, preferences, focusJobId = null }: JobsBoardP
             maxPreferredExperienceYears,
             locationPrefs,
             listingAgePrefs,
+            preferences,
           ),
         ]),
       ) as Record<JobTabId, number>,
-    [jobs, excludedKeywords, salaryPrefs, maxPreferredExperienceYears, locationPrefs, listingAgePrefs],
+    [jobs, excludedKeywords, salaryPrefs, maxPreferredExperienceYears, locationPrefs, listingAgePrefs, preferences],
   );
 
   async function upsertState(jobId: string, patch: Record<string, unknown>) {
@@ -336,15 +318,29 @@ export function JobsBoard({ userId, preferences, focusJobId = null }: JobsBoardP
   }
 
   async function handleReevaluate() {
-    if (maintenancePending) {
-      setSearchMessage("A re-evaluation is already queued or running.");
+    if (maintenancePending || reevaluateRunning) {
+      setSearchMessage("A re-evaluation is already in progress.");
       return;
     }
-    await queueReevaluateStoredJobs(userId);
-    setSearchMessage(
-      "Re-evaluation queued. Stored jobs will be re-filtered (location, remote/hybrid, salary, education, etc.) and re-ranked.",
-    );
-    await loadSearchRequests();
+    setReevaluateRunning(true);
+    setSearchMessage("Starting re-evaluation…");
+    try {
+      const result = await reevaluateStoredJobs(userId, { wait: false });
+      setSearchMessage(result.message);
+      if (result.mode === "queued") {
+        await loadSearchRequests();
+      }
+      if (result.mode === "background") {
+        window.setTimeout(() => void loadJobs(), 90_000);
+        window.setTimeout(() => void loadJobs(), 180_000);
+      } else {
+        await loadJobs();
+      }
+    } catch (err) {
+      setSearchMessage(err instanceof Error ? err.message : "Re-evaluation failed.");
+    } finally {
+      setReevaluateRunning(false);
+    }
   }
 
   async function handleApply(job: JobRecord) {
@@ -434,7 +430,7 @@ export function JobsBoard({ userId, preferences, focusJobId = null }: JobsBoardP
           onSubmit={handleSearch}
           onSourcesChange={handleSourcesChange}
           onReevaluate={handleReevaluate}
-          reevaluatePending={maintenancePending}
+          reevaluatePending={maintenancePending || reevaluateRunning}
           lastRequestMessage={searchMessage}
         />
       </div>

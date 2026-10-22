@@ -2,8 +2,10 @@
 
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
-import { FormEvent, Suspense, useState } from "react";
+import { FormEvent, Suspense, useEffect, useState } from "react";
 import { createClient } from "@/lib/supabase/client";
+import { authErrorMessage } from "@/lib/supabase/config-error";
+import { isSupabaseConfigured } from "@/lib/supabase/env";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -20,6 +22,10 @@ function SignInForm() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
+  useEffect(() => {
+    void createClient().auth.signOut({ scope: "local" });
+  }, []);
+
   async function onSubmit(event: FormEvent) {
     event.preventDefault();
     setLoading(true);
@@ -30,7 +36,7 @@ function SignInForm() {
 
     setLoading(false);
     if (authError) {
-      setError(authError.message);
+      setError(authErrorMessage(authError));
       return;
     }
 
@@ -44,6 +50,15 @@ function SignInForm() {
         <CardTitle>Sign in</CardTitle>
         <CardDescription>Access your JobTracker workspace.</CardDescription>
       </CardHeader>
+      {!isSupabaseConfigured() ? (
+        <p className="mb-4 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">
+          Missing Supabase config. Copy{" "}
+          <code className="text-xs">NEXT_PUBLIC_SUPABASE_URL</code> and{" "}
+          <code className="text-xs">NEXT_PUBLIC_SUPABASE_ANON_KEY</code> into{" "}
+          <code className="text-xs">web/.env.local</code> (see repo{" "}
+          <code className="text-xs">.env.example</code>).
+        </p>
+      ) : null}
       <form onSubmit={onSubmit} className="space-y-4">
         <div>
           <Label htmlFor="email">Email</Label>

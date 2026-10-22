@@ -20,33 +20,21 @@ import {
 } from "@/lib/jobs/logic";
 import { salaryPrefsFromPreferences } from "@/lib/jobs/salary-filter";
 import type { CandidateProfile, JobPreferences, Project, Resume } from "@/lib/types/database";
-import type { JobRecord, UserJobState } from "@/lib/types/jobs";
+import { fetchUserJobRecords } from "@/lib/jobs/fetch-user-jobs";
+import type { JobRecord } from "@/lib/types/jobs";
 
 async function loadDashboardData(userId: string) {
   const supabase = await createClient();
 
-  const [profileRes, resumesRes, projectsRes, prefsRes, jobsRes, statesRes] = await Promise.all([
+  const [profileRes, resumesRes, projectsRes, prefsRes, jobsResult] = await Promise.all([
     supabase.from("candidate_profiles").select("*").eq("user_id", userId).maybeSingle(),
     supabase.from("resumes").select("*").eq("user_id", userId).order("updated_at", { ascending: false }),
     supabase.from("projects").select("*").eq("user_id", userId),
     supabase.from("job_preferences").select("*").eq("user_id", userId).maybeSingle(),
-    supabase
-      .from("jobs")
-      .select(
-        "id, job_hash, title, company, location, description, job_url, salary_min, salary_max, posted_date, match_score, fit_reason, last_seen_at",
-      )
-      .order("match_score", { ascending: false, nullsFirst: false })
-      .limit(200),
-    supabase.from("user_job_states").select("*").eq("user_id", userId),
+    fetchUserJobRecords(supabase, userId),
   ]);
 
-  const jobs = (jobsRes.data ?? []) as Omit<JobRecord, "user_state">[];
-  const states = (statesRes.data ?? []) as UserJobState[];
-  const stateMap = new Map(states.map((state) => [state.job_id, state]));
-  const merged: JobRecord[] = jobs.map((job) => ({
-    ...job,
-    user_state: stateMap.get(job.id),
-  }));
+  const merged: JobRecord[] = jobsResult.jobs;
 
   const preferences = (prefsRes.data as JobPreferences | null) ?? null;
   const excludedKeywords = (preferences?.excluded_keywords ?? [])
@@ -67,13 +55,14 @@ async function loadDashboardData(userId: string) {
         preferences?.max_preferred_experience_years ?? null,
         locationPrefs,
         listingAgePrefs,
+        preferences,
       ),
     ),
   ).slice(0, TOP_MATCHES_LIMIT);
 
-  const appliedAtTimestamps = states
-    .filter((state) => state.status === "applied" && state.applied_at)
-    .map((state) => state.applied_at as string);
+  const appliedAtTimestamps = merged
+    .filter((job) => job.user_state?.status === "applied" && job.user_state.applied_at)
+    .map((job) => job.user_state!.applied_at as string);
 
   return {
     profile: (profileRes.data as CandidateProfile | null) ?? null,

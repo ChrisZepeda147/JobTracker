@@ -7,7 +7,8 @@ const CS_DEGREE_REQUIRED = [
   /\bcs\s+major\b[^.\n]{0,40}\b(?:required|must|mandatory)\b/i,
 ];
 
-const SOFT_EDUCATION = /\b(?:preferred|plus|nice to have|or equivalent|equivalent experience)\b/i;
+const SOFT_EDUCATION =
+  /\b(?:preferred|plus|nice to have|or equivalent|equivalent experience|or related(?:\s+field)?|related field|strongly preferred|is a plus)\b/i;
 
 export function requiresCsDegree(job: {
   title?: string | null;

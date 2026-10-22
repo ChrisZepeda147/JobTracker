@@ -10,6 +10,9 @@ import {
 import { matchesExcludedKeywords } from "@/lib/jobs/keyword-filter";
 import { isEducationBlocked } from "@/lib/jobs/education-filter";
 import { isExperienceOverPreference } from "@/lib/jobs/experience-filter";
+import { isStrictSeniorityTitleBlocked } from "@/lib/jobs/management-filter";
+import { isStrictFiltering } from "@/lib/jobs/strict-mode";
+import type { JobPreferences } from "@/lib/types/database";
 import {
   isLocationPolicyBlocked,
   locationPrefsFromPreferences,
@@ -59,6 +62,15 @@ export function isSalaryBlocked(job: JobRecord, salaryPrefs?: SalaryPrefs): bool
   return false;
 }
 
+/** Backend wrote experience_status=unknown — review YoE before applying (not a hard reject). */
+export function isExperienceNeedsReview(job: JobRecord): boolean {
+  const status = effectiveStatus(job.user_state);
+  if (HISTORY_TAB_STATUSES.has(status)) {
+    return false;
+  }
+  return job.user_state?.experience_status === "unknown";
+}
+
 export function isExperienceBlocked(
   job: JobRecord,
   maxPreferredYears?: number | null,
@@ -73,6 +85,26 @@ export function isExperienceBlocked(
   if (maxPreferredYears != null && isExperienceOverPreference(job, maxPreferredYears)) {
     return true;
   }
+  return false;
+}
+
+export function isManagementBlockedForJob(job: JobRecord): boolean {
+  const status = effectiveStatus(job.user_state);
+  if (HISTORY_TAB_STATUSES.has(status)) return false;
+  return job.user_state?.management_status === "rejected";
+}
+
+export function isSeniorityTitleBlockedForJob(job: JobRecord): boolean {
+  const status = effectiveStatus(job.user_state);
+  if (HISTORY_TAB_STATUSES.has(status)) return false;
+  if (job.user_state?.seniority_status === "rejected") return true;
+  return false;
+}
+
+export function isListingClosedBlocked(job: JobRecord, strict = true): boolean {
+  const status = effectiveStatus(job.user_state);
+  if (HISTORY_TAB_STATUSES.has(status)) return false;
+  if (job.user_state?.listing_status === "closed") return strict;
   return false;
 }
 
@@ -106,14 +138,42 @@ export function isPipelineBlocked(
   maxPreferredExperienceYears?: number | null,
   locationPrefs?: LocationPrefs,
   listingAgePrefs?: ListingAgePrefs,
+  preferences?: JobPreferences | null,
 ): boolean {
+  const strict = isStrictFiltering(preferences);
   return (
     isLocationBlocked(job, forRecommended, locationPrefs) ||
     isSalaryBlocked(job, salaryPrefs) ||
     isExperienceBlocked(job, maxPreferredExperienceYears) ||
+    isManagementBlockedForJob(job) ||
+    isSeniorityTitleBlockedForJob(job) ||
+    isListingClosedBlocked(job, strict) ||
     isEducationBlockedForJob(job) ||
     isKeywordBlocked(job, excludedKeywords) ||
     isListingAgeBlocked(job, listingAgePrefs)
+  );
+}
+
+/** Hard blocks only — unknown YoE is handled via tab routing, not hidden. */
+export function isCorePipelineBlocked(
+  job: JobRecord,
+  forRecommended = false,
+  excludedKeywords: string[] = [],
+  salaryPrefs?: SalaryPrefs,
+  maxPreferredExperienceYears?: number | null,
+  locationPrefs?: LocationPrefs,
+  listingAgePrefs?: ListingAgePrefs,
+  preferences?: JobPreferences | null,
+): boolean {
+  return isPipelineBlocked(
+    job,
+    forRecommended,
+    excludedKeywords,
+    salaryPrefs,
+    maxPreferredExperienceYears,
+    locationPrefs,
+    listingAgePrefs,
+    preferences,
   );
 }
 
@@ -127,15 +187,20 @@ export function isDashboardTopMatch(
   maxPreferredExperienceYears?: number | null,
   locationPrefs?: LocationPrefs,
   listingAgePrefs?: ListingAgePrefs,
+  preferences?: JobPreferences | null,
 ): boolean {
   const status = effectiveStatus(job.user_state);
   if (status === "applied" || status === "skipped") {
     return false;
   }
+  const strict = isStrictFiltering(preferences);
   return (
     !isLocationBlocked(job, false, locationPrefs) &&
     !isSalaryBlocked(job, salaryPrefs) &&
     !isExperienceBlocked(job, maxPreferredExperienceYears) &&
+    !isManagementBlockedForJob(job) &&
+    !isSeniorityTitleBlockedForJob(job) &&
+    !isListingClosedBlocked(job, strict) &&
     !isEducationBlockedForJob(job) &&
     !isKeywordBlocked(job, excludedKeywords) &&
     !isListingAgeBlocked(job, listingAgePrefs)
@@ -164,10 +229,16 @@ function matchesNewTab(
   maxPreferredExperienceYears?: number | null,
   locationPrefs?: LocationPrefs,
   listingAgePrefs?: ListingAgePrefs,
+  preferences?: JobPreferences | null,
 ): boolean {
+  if (effectiveStatus(job.user_state) !== "new") {
+    return false;
+  }
+  if (isExperienceNeedsReview(job)) {
+    return false;
+  }
   if (
-    effectiveStatus(job.user_state) !== "new" ||
-    isPipelineBlocked(
+    isCorePipelineBlocked(
       job,
       false,
       excludedKeywords,
@@ -175,6 +246,7 @@ function matchesNewTab(
       maxPreferredExperienceYears,
       locationPrefs,
       listingAgePrefs,
+      preferences,
     )
   ) {
     return false;
@@ -190,6 +262,7 @@ export function jobMatchesTab(
   maxPreferredExperienceYears?: number | null,
   locationPrefs?: LocationPrefs,
   listingAgePrefs?: ListingAgePrefs,
+  preferences?: JobPreferences | null,
 ): boolean {
   const status = effectiveStatus(job.user_state);
 
@@ -203,6 +276,7 @@ export function jobMatchesTab(
         maxPreferredExperienceYears,
         locationPrefs,
         listingAgePrefs,
+        preferences,
       );
     case "new_remote":
       return matchesNewTab(
@@ -213,13 +287,15 @@ export function jobMatchesTab(
         maxPreferredExperienceYears,
         locationPrefs,
         listingAgePrefs,
+        preferences,
       );
     case "recommended":
       return (
         (job.match_score ?? 0) >= RECOMMENDED_MIN_SCORE &&
         status !== "applied" &&
         status !== "skipped" &&
-        !isPipelineBlocked(
+        !isExperienceNeedsReview(job) &&
+        !isCorePipelineBlocked(
           job,
           true,
           excludedKeywords,
@@ -227,6 +303,7 @@ export function jobMatchesTab(
           maxPreferredExperienceYears,
           locationPrefs,
           listingAgePrefs,
+          preferences,
         )
       );
     case "apply_later":
@@ -240,12 +317,13 @@ export function jobMatchesTab(
           maxPreferredExperienceYears,
           locationPrefs,
           listingAgePrefs,
+          preferences,
         )
       );
     case "needs_decision":
       return (
-        status === "opened" &&
-        !isPipelineBlocked(
+        (status === "opened" || (status === "new" && isExperienceNeedsReview(job))) &&
+        !isCorePipelineBlocked(
           job,
           false,
           excludedKeywords,
@@ -253,6 +331,7 @@ export function jobMatchesTab(
           maxPreferredExperienceYears,
           locationPrefs,
           listingAgePrefs,
+          preferences,
         )
       );
     case "applied":
@@ -272,6 +351,7 @@ export function countForTab(
   maxPreferredExperienceYears?: number | null,
   locationPrefs?: LocationPrefs,
   listingAgePrefs?: ListingAgePrefs,
+  preferences?: JobPreferences | null,
 ): number {
   return jobs.filter((job) =>
     jobMatchesTab(
@@ -282,6 +362,7 @@ export function countForTab(
       maxPreferredExperienceYears,
       locationPrefs,
       listingAgePrefs,
+      preferences,
     ),
   ).length;
 }

@@ -172,7 +172,7 @@ export function JobSearchPanel({
             className="shrink-0"
           >
             <RefreshCw className="mr-2 h-4 w-4" />
-            {reevaluatePending ? "Re-evaluating jobs..." : "Re-evaluate existing jobs"}
+            {reevaluatePending ? "Re-evaluating jobs..." : "Re-evaluate jobs now"}
           </Button>
         ) : null}
 

@@ -145,6 +145,7 @@ class UserSearchContext:
     prefs_salary_min: float | None
     prefs_salary_max: float | None
     max_preferred_experience_years: int | None
+    strict_filtering: bool
     origin_zip: ZipInfo | None
     max_commute_miles: int | None
 
@@ -244,6 +245,7 @@ def load_user_search_context(database: Any, user_id: str, request: SearchRequest
             if (prefs or {}).get("max_preferred_experience_years") is not None
             else None
         ),
+        strict_filtering=bool((prefs or {}).get("strict_filtering", True)),
         origin_zip=zip_info,
         max_commute_miles=max_commute,
     )

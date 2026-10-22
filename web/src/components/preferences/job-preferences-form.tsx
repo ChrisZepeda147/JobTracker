@@ -14,7 +14,7 @@ import {
   ONSITE_MILES_OPTIONS,
   POSTED_WITHIN_OPTIONS,
 } from "@/lib/jobs/constants";
-import { queueReevaluateStoredJobs } from "@/lib/jobs/maintenance";
+import { reevaluateStoredJobs } from "@/lib/jobs/run-reevaluate";
 import type { JobPreferences } from "@/lib/types/database";
 
 const emptyPrefs = (userId: string): Omit<JobPreferences, "created_at" | "updated_at"> => ({
@@ -35,6 +35,7 @@ const emptyPrefs = (userId: string): Omit<JobPreferences, "created_at" | "update
   additional_instructions: "",
   search_sources: [...DEFAULT_SEARCH_SOURCES],
   posted_within_days: DEFAULT_POSTED_WITHIN_DAYS,
+  strict_filtering: true,
 });
 
 export function JobPreferencesForm({ userId }: { userId: string }) {
@@ -60,6 +61,7 @@ export function JobPreferencesForm({ userId }: { userId: string }) {
         setForm({
           ...prefs,
           posted_within_days: prefs.posted_within_days ?? DEFAULT_POSTED_WITHIN_DAYS,
+          strict_filtering: prefs.strict_filtering !== false,
           search_sources:
             prefs.search_sources?.length > 0 ? prefs.search_sources : [...DEFAULT_SEARCH_SOURCES],
         });
@@ -92,13 +94,17 @@ export function JobPreferencesForm({ userId }: { userId: string }) {
     const salaryChanged =
       form.salary_min !== savedSalaryMin || form.salary_max !== savedSalaryMax;
 
+    setSavedSalaryMin(form.salary_min ?? null);
+    setSavedSalaryMax(form.salary_max ?? null);
+    setSaving(false);
+
     if (reevaluateAfterSave) {
       try {
-        await queueReevaluateStoredJobs(userId);
+        const result = await reevaluateStoredJobs(userId, { wait: false });
         setMessage(
           salaryChanged
-            ? "Preferences saved. Existing jobs will be re-checked against your new salary range and re-ranked."
-            : "Preferences saved. Existing jobs will be re-filtered and re-ranked shortly.",
+            ? `Preferences saved. ${result.message}`
+            : `Preferences saved. ${result.message}`,
         );
       } catch (reevaluateError) {
         setMessage("Preferences saved.");
@@ -110,13 +116,9 @@ export function JobPreferencesForm({ userId }: { userId: string }) {
       }
     } else {
       setMessage(
-        "Preferences saved. Use Re-evaluate existing jobs on the Jobs page when you want to update stored results.",
+        "Preferences saved. Use Re-evaluate jobs now on the Jobs page when you want to update stored results.",
       );
     }
-
-    setSavedSalaryMin(form.salary_min ?? null);
-    setSavedSalaryMax(form.salary_max ?? null);
-    setSaving(false);
   }
 
   if (loading) return <p className="text-sm text-muted">Loading preferences...</p>;
@@ -219,6 +221,14 @@ export function JobPreferencesForm({ userId }: { userId: string }) {
               })
             }
           />
+          <label className="mt-2 flex items-center gap-2 text-sm text-zinc-700">
+            <input
+              type="checkbox"
+              checked={form.strict_filtering !== false}
+              onChange={(e) => setForm({ ...form, strict_filtering: e.target.checked })}
+            />
+            Strict filtering (quality over quantity — hydrate postings, reject senior/management, verify listings)
+          </label>
         </div>
 
         <TagInput
@@ -318,7 +328,7 @@ export function JobPreferencesForm({ userId }: { userId: string }) {
           checked={reevaluateAfterSave}
           onChange={(e) => setReevaluateAfterSave(e.target.checked)}
         />
-        After saving, re-check and re-rank my existing jobs (filters first, then match scores)
+        After saving, update my existing jobs in the background (does not block save)
       </label>
 
       <Button type="submit" disabled={saving}>

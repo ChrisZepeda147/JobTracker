@@ -56,6 +56,7 @@ export type JobPreferences = {
   additional_instructions: string;
   search_sources: string[];
   posted_within_days: number | null;
+  strict_filtering: boolean;
   created_at: string;
   updated_at: string;
 };

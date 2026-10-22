@@ -912,6 +912,12 @@ class JobDatabase:
                 "keyword_status": row.get("keyword_status"),
                 "experience_status": row.get("experience_status"),
                 "education_status": row.get("education_status"),
+                "management_status": row.get("management_status"),
+                "seniority_status": row.get("seniority_status"),
+                "listing_status": row.get("listing_status"),
+                "listing_check_reason": row.get("listing_check_reason"),
+                "listing_checked_at": row.get("listing_checked_at"),
+                "filter_reason": row.get("filter_reason"),
                 "is_stretch": row.get("is_stretch"),
             }
             try:
@@ -979,6 +985,26 @@ class JobDatabase:
                     "Failed to update experience requirement for job hash %s",
                     job.normalized_url_hash,
                 )
+        return updated
+
+    def update_job_descriptions(self, jobs: Iterable[RawJob]) -> int:
+        """Persist hydrated posting text when we have a richer description."""
+        updated = 0
+        for job in jobs:
+            description = (job.description or "").strip()
+            if len(description) < 120 or not job.normalized_url_hash:
+                continue
+            try:
+                response = (
+                    self.client.table("jobs")
+                    .update({"description": description})
+                    .eq("job_hash", job.normalized_url_hash)
+                    .execute()
+                )
+                if response.data:
+                    updated += 1
+            except Exception:
+                logger.exception("Failed to update description for job hash %s", job.normalized_url_hash)
         return updated
 
     def job_ids_for_hashes(self, hashes: Sequence[str]) -> dict[str, str]:

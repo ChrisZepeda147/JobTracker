@@ -5,6 +5,7 @@ import {
   sanitizeJobLocation,
   type WorkArrangement,
 } from "@/lib/jobs/format";
+import { remotePostingContradicted } from "@/lib/jobs/remote-contradiction";
 
 const STATE_ABBR_RE =
   /,\s*(AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY|DC)\b/i;
@@ -71,7 +72,8 @@ export function isLocationPolicyBlocked(
 
   const prefs = locationPrefs;
   const arrangement = effectiveWorkArrangement(job, job.user_state?.work_arrangement);
-  const jobState = parseStateAbbr(job.location);
+  const locationLine = job.location ?? "";
+  const jobState = parseStateAbbr(locationLine);
   const homeState = prefs?.preferredState ?? null;
 
   if (
@@ -106,9 +108,26 @@ export function isLocationPolicyBlocked(
     }
   }
 
+  if (
+    isFullyRemoteArrangement(arrangement) &&
+    remotePostingContradicted(job)
+  ) {
+    return true;
+  }
+
   if (job.user_state?.location_status === "pass") {
+    if (
+      isFullyRemoteArrangement(arrangement) &&
+      (!locationLine.trim() ||
+        BROAD_LOCATION_RE.test(sanitizeJobLocation(locationLine)))
+    ) {
+      return true;
+    }
     return false;
   }
 
   return true;
 }
+
+const BROAD_LOCATION_RE =
+  /^(?:united states(?:\s+of\s+america)?|usa|u\.?s\.?a?\.?|us|america|remote)$/i;

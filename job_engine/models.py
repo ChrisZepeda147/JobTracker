@@ -61,6 +61,13 @@ class RawJob:
     experience_requirement: str | None = None
     salary_page_checked: bool = False
     is_stretch: bool = False
+    hydration_attempted: bool = False
+    management_status: str | None = None
+    seniority_status: str | None = None
+    listing_status: str | None = None
+    listing_check_reason: str | None = None
+    listing_checked_at: str | None = None
+    filter_reason: str | None = None
 
     def generate_hash(self) -> str:
         """MD5 of company + title + location for strict cross-board deduplication."""

@@ -35,62 +35,18 @@ _USER_AGENT = (
     "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 )
 _MAX_HTML_BYTES = 1_500_000
-_MIN_FETCH_INTERVAL = 1.25
-_last_fetch_at = 0.0
-_fetch_budget: int | None = None
+from job_engine.posting_fetch import fetch_posting_html as _fetch_posting_html
+from job_engine.posting_fetch import set_fetch_budget as _set_fetch_budget
 
 
 def set_fetch_budget(limit: int | None) -> None:
     """Limit posting fetches per worker run (None = unlimited for backfill)."""
-    global _fetch_budget
-    _fetch_budget = limit
-
-
-def _throttle_fetches() -> None:
-    global _last_fetch_at
-    elapsed = time.monotonic() - _last_fetch_at
-    if elapsed < _MIN_FETCH_INTERVAL:
-        time.sleep(_MIN_FETCH_INTERVAL - elapsed)
-    _last_fetch_at = time.monotonic()
+    _set_fetch_budget(limit)
 
 
 def fetch_posting_html(url: str, *, timeout: float = 18.0) -> str | None:
     """Download a job posting page for salary extraction."""
-    global _fetch_budget
-    if _fetch_budget is not None:
-        if _fetch_budget <= 0:
-            return None
-        _fetch_budget -= 1
-
-    if not url or not url.startswith(("http://", "https://")):
-        return None
-
-    _throttle_fetches()
-    headers = {"User-Agent": _USER_AGENT, "Accept": "text/html,application/xhtml+xml"}
-
-    try:
-        if HAS_CURL_CFFI and cffi_requests is not None:
-            response = cffi_requests.get(
-                url,
-                headers=headers,
-                timeout=timeout,
-                impersonate="chrome",
-            )
-        elif std_requests is not None:
-            response = std_requests.get(url, headers=headers, timeout=timeout)
-        else:
-            return None
-
-        if getattr(response, "status_code", 0) != 200:
-            logger.debug("Posting fetch HTTP %s for %s", response.status_code, url[:80])
-            return None
-
-        content = response.content[:_MAX_HTML_BYTES]
-        encoding = getattr(response, "encoding", None) or "utf-8"
-        return content.decode(encoding, errors="replace")
-    except Exception:
-        logger.debug("Posting fetch failed for %s", url[:80], exc_info=True)
-        return None
+    return _fetch_posting_html(url, timeout=timeout)
 
 
 def _parse_json_ld_salary(node: Any) -> tuple[float | None, float | None]:

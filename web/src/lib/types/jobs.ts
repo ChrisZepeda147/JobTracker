@@ -7,7 +7,8 @@ export type JobRecord = {
   company: string;
   location: string;
   job_url: string;
-  description: string;
+  /** Omitted on list loads for speed; filters use worker-written user_state when set. */
+  description?: string | null;
   site: string;
   salary_min: number | null;
   salary_max: number | null;
@@ -36,6 +37,12 @@ export type UserJobState = {
   keyword_status: "pass" | "rejected" | null;
   experience_status: "pass" | "rejected" | "unknown" | null;
   education_status: "pass" | "rejected" | null;
+  management_status: "pass" | "rejected" | null;
+  seniority_status: "pass" | "rejected" | null;
+  listing_status: "open" | "closed" | "unknown" | null;
+  listing_checked_at: string | null;
+  listing_check_reason: string | null;
+  filter_reason: string | null;
   is_stretch: boolean | null;
   created_at: string;
   updated_at: string;

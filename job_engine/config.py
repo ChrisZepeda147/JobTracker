@@ -101,6 +101,8 @@ class Settings:
     proxy_list: list[str] = field(default_factory=list)
     greenhouse_board_slugs: list[str] = field(default_factory=list)
     wellfound_api_key: str = ""
+    strict_hydration_budget: int = 60
+    strict_availability_budget: int = 45
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -147,6 +149,15 @@ class Settings:
         except ValueError:
             results_wanted = DEFAULT_RESULTS_WANTED_PER_QUERY
 
+        try:
+            hydration_budget = int(_clean("STRICT_HYDRATION_BUDGET") or 60)
+        except ValueError:
+            hydration_budget = 60
+        try:
+            availability_budget = int(_clean("STRICT_AVAILABILITY_BUDGET") or 45)
+        except ValueError:
+            availability_budget = 45
+
         return cls(
             supabase_url=_clean("SUPABASE_URL"),
             supabase_key=key,
@@ -166,6 +177,8 @@ class Settings:
             proxy_list=proxies,
             greenhouse_board_slugs=greenhouse_boards,
             wellfound_api_key=_clean("WELLFOUND_API_KEY"),
+            strict_hydration_budget=max(0, hydration_budget),
+            strict_availability_budget=max(0, availability_budget),
         )
 
     def available_providers(self) -> list[str]:

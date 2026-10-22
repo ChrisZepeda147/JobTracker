@@ -110,6 +110,19 @@ _ARRANGEMENT_SUFFIX_RE = re.compile(
     r"\s*[-–—•|]?\s*(?:remote|hybrid|on[- ]?site|in[- ]?office)\s*$",
     re.IGNORECASE,
 )
+_WORKPLACE_TYPE_RE = re.compile(
+    r"workplace\s*type\s*:\s*(?P<mode>remote|hybrid|on[-\s]?site)",
+    re.IGNORECASE,
+)
+_JOB_LOCATION_LABEL_RE = re.compile(
+    r"(?:^|\n)\s*(?:job\s+location|primary\s+location|work\s+location|office\s+location)"
+    r"\s*:\s*(?P<loc>[^\n]+)",
+    re.IGNORECASE | re.MULTILINE,
+)
+_IN_OFFICE_DAYS_RE = re.compile(
+    r"\b\d+\s+days?\s+(?:a\s+week\s+)?(?:in|on)[- ]?(?:the\s+)?(?:office|site)\b",
+    re.IGNORECASE,
+)
 
 
 def geographic_job_location(location: str) -> str:
@@ -289,9 +302,83 @@ def explicit_remote_residency_state(job: RawJob) -> str | None:
     return None
 
 
+def _workplace_type_from_description(job: RawJob) -> str | None:
+    haystack = (job.description or "")[:8000]
+    match = _WORKPLACE_TYPE_RE.search(haystack)
+    if not match:
+        return None
+    token = match.group("mode").lower().replace(" ", "")
+    if "hybrid" in token:
+        return "hybrid"
+    if "remote" in token:
+        return "remote"
+    if "site" in token:
+        return "onsite"
+    return None
+
+
+def explicit_location_from_description(job: RawJob) -> str | None:
+    haystack = (job.description or "")[:12000]
+    match = _JOB_LOCATION_LABEL_RE.search(haystack)
+    if not match:
+        return None
+    loc = match.group("loc").strip().rstrip(".")
+    if not loc or _is_broad_location(loc):
+        return None
+    return loc
+
+
+def merged_posting_location(job: RawJob) -> str:
+    """Prefer a specific place from the body when the board only says 'United States' / Remote."""
+    location = (job.location or "").strip()
+    if location and not _is_broad_location(location):
+        return location
+    explicit = explicit_location_from_description(job)
+    if explicit:
+        return explicit
+    return location
+
+
+def remote_posting_contradicted(job: RawJob) -> tuple[bool, str]:
+    """Remote-labeled jobs that the body says are hybrid, onsite, or tied to a place."""
+    haystack = "\n".join(
+        part for part in ((job.description or "")[:12000], job.location or "") if part
+    )
+    if _is_explicitly_non_us(haystack):
+        return True, "non-US location mentioned in posting"
+
+    workplace = _workplace_type_from_description(job)
+    if workplace in ("hybrid", "onsite"):
+        return True, f"workplace type is {workplace}"
+
+    if _IN_OFFICE_DAYS_RE.search(haystack):
+        return True, "requires days in office"
+
+    line_mode = None
+    from job_engine.matcher import _work_mode_from_description_lines
+
+    line_mode = _work_mode_from_description_lines(job.description)
+    if line_mode in ("hybrid", "onsite"):
+        return True, f"posting lists {line_mode}"
+
+    location = (job.location or "").strip()
+    if _is_broad_location(location) or _REMOTE_RE.search(location):
+        head = haystack[:4000]
+        if _HYBRID_RE.search(head) and not _HYBRID_RE.search(location):
+            return True, "hybrid mentioned in posting body"
+        if _ONSITE_RE.search(head) and not _ONSITE_RE.search(location):
+            return True, "on-site mentioned in posting body"
+
+    return False, ""
+
+
 def effective_work_mode(job: RawJob) -> str:
     """Work mode for filtering; hybrid in body beats a Remote- prefix on the location line."""
     from job_engine.matcher import _work_mode_from_description_lines
+
+    workplace = _workplace_type_from_description(job)
+    if workplace:
+        return workplace
 
     line_mode = _work_mode_from_description_lines(job.description)
     if line_mode:
@@ -374,7 +461,7 @@ def _remote_blocked_by_residency(job: RawJob, preferred_state: str | None) -> bo
 
 def evaluate_job_location(job: RawJob, ctx: LocationContext) -> LocationResult:
     """Hard-filter a job by work arrangement and commute distance."""
-    location = (job.location or "").strip()
+    location = merged_posting_location(job).strip()
     mode = effective_work_mode(job)
 
     if _is_explicitly_non_us(location):
@@ -409,9 +496,25 @@ def evaluate_job_location(job: RawJob, ctx: LocationContext) -> LocationResult:
                 "remote",
                 reason=f"remote restricted to {restricted}, not nationwide",
             )
+        contradicted, detail = remote_posting_contradicted(job)
+        if contradicted:
+            logger.info("[FILTER] rejected: remote contradicted — %s", detail)
+            return LocationResult(False, "rejected", "hybrid", reason=f"not fully remote: {detail}")
+
         commute = _commute_verdict(ctx, location, "remote")
         if commute is not None:
             return commute
+        if _is_broad_location(location):
+            if not ctx.remote_allowed or not _is_us_eligible(location, mode):
+                return LocationResult(
+                    False, "rejected", "remote", reason="remote not allowed or outside US"
+                )
+            return LocationResult(
+                True,
+                "pass",
+                "remote",
+                reason="remote US-eligible (nationwide posting)",
+            )
         if ctx.remote_allowed and _is_us_eligible(location, mode):
             return LocationResult(True, "pass", "remote", reason="remote US-eligible")
         return LocationResult(False, "rejected", "remote", reason="remote not allowed or outside US")
@@ -421,6 +524,13 @@ def evaluate_job_location(job: RawJob, ctx: LocationContext) -> LocationResult:
             return LocationResult(False, "rejected", mode, reason="hybrid not allowed")
         if mode == "onsite" and not ctx.onsite_allowed:
             return LocationResult(False, "rejected", mode, reason="onsite not allowed")
+        if _is_broad_location(location):
+            return LocationResult(
+                False,
+                "rejected",
+                mode,
+                reason=f"{mode} posting without a specific city (not fully remote)",
+            )
 
         miles, detail = _commute_miles(ctx.origin_zip, ctx.max_commute_miles, location)
         if miles is not None and ctx.max_commute_miles is not None:
@@ -443,12 +553,21 @@ def evaluate_job_location(job: RawJob, ctx: LocationContext) -> LocationResult:
             reason=f"location unverified: {detail}",
         )
 
-    # Unknown arrangement
+    # Unknown arrangement — do not assume nationwide remote from "United States" alone.
     if _is_broad_location(location):
-        if ctx.remote_allowed and _is_us_eligible(location, "remote"):
-            return LocationResult(True, "pass", "remote", reason="broad US location, remote allowed")
+        contradicted, detail = remote_posting_contradicted(job)
+        if contradicted:
+            return LocationResult(
+                False,
+                "rejected",
+                "hybrid",
+                reason=f"broad location but {detail}",
+            )
         return LocationResult(
-            False, "rejected", "unknown", reason="broad location requires remote work mode"
+            False,
+            "unverified",
+            "unknown",
+            reason="broad location — work mode not confirmed (open posting to verify)",
         )
 
     # Specific city with unknown arrangement — treat as potential hybrid/onsite, never as remote.

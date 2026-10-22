@@ -90,7 +90,7 @@ export function JobCard({
         )}
         <span>{workLocation}</span>
         {source ? <span>{source}</span> : null}
-        {posted ? <span>Posted {posted}</span> : null}
+        {posted ? <span>{posted}</span> : null}
         {job.experience_requirement ? <span>{job.experience_requirement}</span> : null}
       </div>
 

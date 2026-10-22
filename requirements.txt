@@ -17,3 +17,6 @@ cohere>=5.13.0
 
 # Optional paid provider
 anthropic>=0.40.0
+
+# Tests
+pytest>=8.0.0

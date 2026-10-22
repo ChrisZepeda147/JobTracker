@@ -49,12 +49,24 @@ _TITLE_IMPLICIT_YOE: tuple[tuple[re.Pattern[str], int], ...] = (
     (re.compile(r"\b(?:senior|sr\.?)\b", re.IGNORECASE), 5),
 )
 
+_JUNIOR_COMPATIBLE_TITLE_RES: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bjunior\b", re.IGNORECASE),
+    re.compile(r"\bassociate\b", re.IGNORECASE),
+    re.compile(r"\bentry[\s-]?level\b", re.IGNORECASE),
+    re.compile(r"\bsoftware engineer\s+i\b", re.IGNORECASE),
+    re.compile(r"\bsoftware developer\s+i\b", re.IGNORECASE),
+    re.compile(r"\b(?:swe|sde)\s+i\b", re.IGNORECASE),
+    re.compile(r"\bengineer\s+i\b", re.IGNORECASE),
+)
+
 _MAX_REASONABLE_YOE = 25
 
 
 @dataclass(frozen=True)
 class ExperienceContext:
     max_preferred_years: int | None
+    strict: bool = False
+    hydration_attempted: bool = False
 
 
 @dataclass
@@ -65,11 +77,13 @@ class ExperienceResult:
     reason: str = ""
 
 
-def experience_context_from_prefs(prefs: dict | None) -> ExperienceContext:
+def experience_context_from_prefs(prefs: dict | None, *, strict: bool | None = None) -> ExperienceContext:
     prefs = prefs or {}
     raw = prefs.get("max_preferred_experience_years")
     max_years = int(raw) if raw is not None else None
-    return ExperienceContext(max_preferred_years=max_years)
+    if strict is None:
+        strict = bool(prefs.get("strict_filtering", True))
+    return ExperienceContext(max_preferred_years=max_years, strict=strict)
 
 
 def _normalize_experience_text(text: str) -> str:
@@ -85,6 +99,13 @@ def _normalize_experience_text(text: str) -> str:
 def experience_haystack(job: RawJob) -> str:
     parts = [part for part in (job.title or "", job.description or "") if part]
     return _normalize_experience_text("\n".join(parts))
+
+
+def has_junior_compatible_title(title: str | None) -> bool:
+    """Title signals entry-level / junior IC (does not override explicit YoE in body)."""
+    if not title or not title.strip():
+        return False
+    return any(pattern.search(title) for pattern in _JUNIOR_COMPATIBLE_TITLE_RES)
 
 
 def infer_required_years_from_title(title: str | None) -> int | None:
@@ -144,7 +165,10 @@ def evaluate_job_experience(job: RawJob, ctx: ExperienceContext) -> ExperienceRe
 
     required = extract_required_years_for_job(job)
     if required is None:
-        return ExperienceResult(True, "unknown", reason="experience requirement not listed")
+        note = "experience requirement not listed"
+        if has_junior_compatible_title(job.title):
+            note = "experience unverified; junior-compatible title"
+        return ExperienceResult(True, "unknown", reason=note)
 
     if required > ctx.max_preferred_years:
         label = format_experience_requirement(required)

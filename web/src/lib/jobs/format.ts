@@ -213,9 +213,9 @@ export function formatWorkLocationLine(
       US_BROAD_LOCATION_RE.test(geo) ||
       /^(united states|usa|u\.?s\.?)$/i.test(geo);
     if (!isBroad) {
-      return "Fully remote • United States";
+      return `Remote • ${geo} (verify on posting)`;
     }
-    return geo ? `Fully remote • ${geo}` : "Fully remote";
+    return "Remote • US (verify workplace on posting)";
   }
 
   if (arrangement === "Unknown") {

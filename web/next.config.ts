@@ -4,9 +4,10 @@ import { fileURLToPath } from "url";
 
 const webDir = path.dirname(fileURLToPath(import.meta.url));
 
+/** Turbopack root = this app only (not the monorepo parent with .venv / Python). */
 const nextConfig: NextConfig = {
   turbopack: {
-    root: path.join(webDir, ".."),
+    root: webDir,
   },
 };
 

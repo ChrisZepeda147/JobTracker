@@ -96,8 +96,8 @@ export function JobPreferencesSummary({ preferences }: { preferences: JobPrefere
               Job Preferences
             </Link>
             , then use{" "}
-            <span className="font-medium text-foreground">Re-evaluate existing jobs</span> to update
-            stored results.
+            <span className="font-medium text-foreground">Re-evaluate jobs now</span> on the Jobs page
+            (instant on localhost) to refresh filters and scores.
           </p>
         </div>
         <Link

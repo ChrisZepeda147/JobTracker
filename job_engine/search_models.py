@@ -98,6 +98,28 @@ class SearchRequest:
             return [legacy]
         return ["Software Engineer"]
 
+    @classmethod
+    def synthetic_refilter(cls, user_id: str, prefs: dict[str, Any] | None) -> "SearchRequest":
+        """Minimal request for stored-job refilter (work-mode flags from preferences)."""
+        prefs = prefs or {}
+        return cls(
+            id="refilter",
+            user_id=user_id,
+            query="",
+            titles=list(prefs.get("target_roles") or ["Software Engineer"]),
+            location=str((prefs.get("preferred_locations") or [""])[0] if prefs.get("preferred_locations") else ""),
+            location_zip=prefs.get("home_zip"),
+            salary_min=_float_or_none(prefs.get("salary_min")),
+            salary_max=_float_or_none(prefs.get("salary_max")),
+            posted_within_days=_int_or_none(prefs.get("posted_within_days")),
+            remote_allowed=bool(prefs.get("remote_allowed", True)),
+            hybrid_allowed=bool(prefs.get("hybrid_allowed", True)),
+            onsite_allowed=bool(prefs.get("onsite_allowed", False)),
+            max_onsite_miles=_int_or_none(prefs.get("max_commute_miles")),
+            sources=list(prefs.get("search_sources") or []),
+            nationwide_remote=False,
+        )
+
     def resolve_scraper_sites(self) -> tuple[list[str], dict[str, dict[str, Any]]]:
         """Return scraper site keys to run and pre-built results for skipped sources."""
         sites: list[str] = []

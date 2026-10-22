@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { killProcessTreeByPid, stopStaleNextDev } from "./stop-stale-next.mjs";
+import { loadMonorepoEnv, parseEnvFile } from "./load-env.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const webDir = path.join(root, "web");
@@ -16,12 +17,23 @@ if (!fs.existsSync(nextBin)) {
 }
 
 stopStaleNextDev();
+loadMonorepoEnv(root);
 
-const child = spawn(nextBin, ["dev", "-p", "3000"], {
+const webLocal = {
+  ...parseEnvFile(path.join(webDir, ".env.local")),
+  ...parseEnvFile(path.join(webDir, ".env")),
+};
+
+const child = spawn(nextBin, ["dev", "--turbo", "-p", "3000"], {
   cwd: webDir,
   stdio: "inherit",
   shell: win,
-  env: { ...process.env, PORT: "3000" },
+  env: {
+    ...process.env,
+    ...webLocal,
+    PORT: "3000",
+    JOBTRACKER_ROOT: root,
+  },
 });
 
 child.on("exit", (code, signal) => {

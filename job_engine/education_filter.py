@@ -41,7 +41,8 @@ _CS_DEGREE_REQUIRED_RES: tuple[re.Pattern[str], ...] = (
 )
 
 _SOFT_EDUCATION_RE = re.compile(
-    r"\b(?:preferred|plus|nice to have|or equivalent|equivalent experience)\b",
+    r"\b(?:preferred|plus|nice to have|or equivalent|equivalent experience|"
+    r"or related(?:\s+field)?|related field|strongly preferred|is a plus)\b",
     re.IGNORECASE,
 )
 

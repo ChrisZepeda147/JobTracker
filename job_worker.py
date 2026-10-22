@@ -10,7 +10,12 @@ import sys
 import time
 
 from job_engine.database import DatabaseError, JobDatabase
-from job_engine.search_worker import process_search_request, refilter_user_job_locations, rescore_all_stored_jobs
+from job_engine.search_worker import (
+    process_search_request,
+    reevaluate_all_stored_jobs,
+    refilter_user_job_locations,
+    rescore_all_stored_jobs,
+)
 
 log = logging.getLogger("worker")
 _shutdown = False
@@ -107,6 +112,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Re-filter stored jobs by commute distance (optional user UUID)",
     )
     parser.add_argument(
+        "--reevaluate-all",
+        nargs="?",
+        const="__auto__",
+        metavar="USER_ID",
+        help="Re-filter then re-score all stored jobs (optional user UUID)",
+    )
+    parser.add_argument(
         "--poll",
         type=float,
         default=8.0,
@@ -128,6 +140,18 @@ def main(argv: list[str] | None = None) -> int:
     except DatabaseError as exc:
         log.error("%s", exc)
         return 1
+
+    if args.reevaluate_all is not None:
+        user_id = None if args.reevaluate_all == "__auto__" else str(args.reevaluate_all).strip()
+        if not user_id:
+            user_id = database.load_primary_user_id()
+        if not user_id:
+            log.error("No user id found. Pass --reevaluate-all USER_ID explicitly.")
+            return 1
+        refiltered, rescored = reevaluate_all_stored_jobs(database, user_id)
+        log.info("[DONE] Re-evaluated refiltered=%s rescored=%s", refiltered, rescored)
+        print(f"REEVAL_RESULT refiltered={refiltered} rescored={rescored}", flush=True)
+        return 0
 
     if args.refilter_locations is not None:
         user_id = None if args.refilter_locations == "__auto__" else str(args.refilter_locations).strip()

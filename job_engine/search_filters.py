@@ -4,9 +4,17 @@ from __future__ import annotations
 
 import logging
 import re
+from typing import TYPE_CHECKING
 
 from job_engine.education_filter import evaluate_job_education
-from job_engine.experience_filter import ExperienceContext, evaluate_job_experience, format_experience_requirement
+from job_engine.experience_filter import (
+    ExperienceContext,
+    evaluate_job_experience,
+    extract_required_years_for_job,
+    format_experience_requirement,
+    has_junior_compatible_title,
+)
+from job_engine.rejection_audit import RejectionAudit
 from job_engine.keyword_filter import evaluate_job_keywords
 from job_engine.location_filter import (
     LocationContext,
@@ -16,11 +24,15 @@ from job_engine.location_filter import (
     location_context_from_prefs,
 )
 from job_engine.location_utils import state_abbr_from_location
+from job_engine.management_filter import evaluate_management_requirements, evaluate_strict_seniority_title
 from job_engine.matcher import FilterVerdict, HardFilter, _normalize
 from job_engine.models import RawJob
 from job_engine.salary_filter import SalaryContext, evaluate_job_salary
 from job_engine.job_feedback import evaluate_job_feedback
 from job_engine.user_context import UserSearchContext
+
+if TYPE_CHECKING:
+    from job_engine.filter_stats import SearchFilterStats
 
 logger = logging.getLogger("job_engine.search_filters")
 
@@ -33,6 +45,11 @@ _LEVEL_TWO_PLUS_TITLE_RES = (
 )
 
 
+def _set_filter_reason(job: RawJob, reason: str) -> None:
+    if reason:
+        job.filter_reason = reason
+
+
 class SearchRequestFilter(HardFilter):
     """Applies profile hard filters plus the queued search request constraints."""
 
@@ -42,11 +59,16 @@ class SearchRequestFilter(HardFilter):
         database=None,
         user_suppressed_hashes: set[str] | None = None,
         salary_database=None,
+        stats: SearchFilterStats | None = None,
+        audit: RejectionAudit | None = None,
     ) -> None:
         super().__init__(ctx.profile, database=database)
         self.ctx = ctx
         self._user_suppressed = user_suppressed_hashes or set()
         self._salary_database = salary_database
+        self._stats = stats
+        self._audit = audit or RejectionAudit()
+        self._strict = ctx.strict_filtering
         self._seniority = [
             re.compile(rf"\b{re.escape(_normalize(s))}\b", re.IGNORECASE)
             for s in ctx.excluded_seniority
@@ -67,14 +89,18 @@ class SearchRequestFilter(HardFilter):
             salary_min=ctx.prefs_salary_min,
             salary_max=ctx.prefs_salary_max,
         )
-        self._experience_ctx = ExperienceContext(
+        self._experience_base = ExperienceContext(
             max_preferred_years=ctx.max_preferred_experience_years,
+            strict=self._strict,
         )
 
     def evaluate(self, job: RawJob) -> FilterVerdict:
         """Location commute filter runs before scoring and before legacy text matching."""
+        job.filter_reason = None
         for check in (
             self._check_blacklist,
+            self._check_strict_seniority_title,
+            self._check_management,
             self._check_excluded_keywords,
             self._check_experience,
             self._check_education,
@@ -84,6 +110,7 @@ class SearchRequestFilter(HardFilter):
         ):
             verdict = check(job)
             if not verdict.passed:
+                _set_filter_reason(job, verdict.reason)
                 return verdict
 
         for check in (
@@ -95,8 +122,35 @@ class SearchRequestFilter(HardFilter):
         ):
             verdict = check(job)
             if not verdict.passed:
+                _set_filter_reason(job, verdict.reason)
                 return verdict
         return FilterVerdict(True)
+
+    def apply(self, jobs):  # type: ignore[override]
+        survivors: list[RawJob] = []
+        rejections: dict[str, int] = {}
+        for job in jobs:
+            verdict = self.evaluate(job)
+            if verdict.passed:
+                survivors.append(job)
+                continue
+            bucket = (verdict.reason or "rejected").split(":")[0]
+            rejections[bucket] = rejections.get(bucket, 0) + 1
+        if self._stats:
+            self._stats.hard_filter_survivors = len(survivors)
+        self._audit.log_samples(logger)
+        return survivors, rejections
+
+    def _experience_context_for(self, job: RawJob) -> ExperienceContext:
+        hydration_attempted = bool(
+            getattr(job, "hydration_attempted", False)
+            or len((job.description or "").strip()) >= 120
+        )
+        return ExperienceContext(
+            max_preferred_years=self._experience_base.max_preferred_years,
+            strict=self._experience_base.strict,
+            hydration_attempted=hydration_attempted,
+        )
 
     def _check_location(self, job: RawJob) -> FilterVerdict:
         result = evaluate_job_location(job, self._location_ctx)
@@ -108,17 +162,60 @@ class SearchRequestFilter(HardFilter):
             return FilterVerdict(True, result.reason)
 
         if result.status == "unverified":
+            if self._stats:
+                self._stats.location_rejected += 1
+            self._audit.add("location_rejected", job, "location unverified")
             return FilterVerdict(False, "location unverified")
 
+        if self._stats:
+            self._stats.location_rejected += 1
+        self._audit.add("location_rejected", job, result.reason)
         return FilterVerdict(False, result.reason)
 
     def _check_experience(self, job: RawJob) -> FilterVerdict:
-        result = evaluate_job_experience(job, self._experience_ctx)
+        result = evaluate_job_experience(job, self._experience_context_for(job))
         job.experience_status = result.status
         if result.required_years is not None:
             job.experience_requirement = format_experience_requirement(result.required_years)
         if result.passed:
+            if result.status == "unknown":
+                detail = "no YoE parsed"
+                if has_junior_compatible_title(job.title):
+                    detail += "; junior-compatible title"
+                if self._stats:
+                    self._stats.experience_unknown_kept += 1
+                self._audit.add("experience_unknown_kept", job, detail)
             return FilterVerdict(True, result.reason)
+        if self._stats:
+            self._stats.experience_rejected += 1
+        parsed = result.required_years if result.required_years is not None else extract_required_years_for_job(job)
+        self._audit.add("experience_rejected", job, f"parsed_required_years={parsed}")
+        return FilterVerdict(False, result.reason)
+
+    def _check_management(self, job: RawJob) -> FilterVerdict:
+        if not self._strict:
+            job.management_status = "pass"
+            return FilterVerdict(True)
+        result = evaluate_management_requirements(job)
+        job.management_status = result.status
+        if result.passed:
+            return FilterVerdict(True)
+        if self._stats:
+            self._stats.management_rejected += 1
+        self._audit.add("management_rejected", job, result.reason)
+        return FilterVerdict(False, result.reason)
+
+    def _check_strict_seniority_title(self, job: RawJob) -> FilterVerdict:
+        if not self._strict:
+            job.seniority_status = "pass"
+            return FilterVerdict(True)
+        result = evaluate_strict_seniority_title(job)
+        job.seniority_status = result.status
+        if result.passed:
+            return FilterVerdict(True)
+        if self._stats:
+            self._stats.seniority_rejected += 1
+        self._audit.add("seniority_rejected", job, result.reason)
         return FilterVerdict(False, result.reason)
 
     def _check_education(self, job: RawJob) -> FilterVerdict:
@@ -126,6 +223,9 @@ class SearchRequestFilter(HardFilter):
         job.education_status = result.status
         if result.passed:
             return FilterVerdict(True, result.reason)
+        if self._stats:
+            self._stats.education_rejected += 1
+        self._audit.add("education_rejected", job, result.reason)
         return FilterVerdict(False, result.reason)
 
     def _check_salary(self, job: RawJob) -> FilterVerdict:
@@ -138,6 +238,9 @@ class SearchRequestFilter(HardFilter):
         job.salary_status = result.status
         if result.passed:
             return FilterVerdict(True, result.reason)
+        if self._stats:
+            self._stats.salary_rejected += 1
+        self._audit.add("salary_rejected", job, result.reason)
         return FilterVerdict(False, result.reason)
 
     def _check_title_level(self, job: RawJob) -> FilterVerdict:
@@ -188,6 +291,9 @@ class SearchRequestFilter(HardFilter):
         job.keyword_status = result.status
         if result.passed:
             return FilterVerdict(True)
+        if self._stats:
+            self._stats.excluded_keyword_rejected += 1
+        self._audit.add("excluded_keyword_rejected", job, result.reason)
         return FilterVerdict(False, result.reason)
 
     def _check_excluded_seniority(self, job: RawJob) -> FilterVerdict:

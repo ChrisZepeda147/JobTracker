@@ -4,20 +4,19 @@
  * Usage: node scripts/reevaluate-jobs.mjs [USER_ID]
  */
 import { spawnSync } from "node:child_process";
-import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { loadMonorepoEnv } from "./load-env.mjs";
+import {
+  isWin,
+  requirePythonVenv,
+  resolveProjectRoot,
+  resolvePython,
+} from "./run-utils.mjs";
 
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const win = process.platform === "win32";
-const python = win
-  ? path.join(root, ".venv", "Scripts", "python.exe")
-  : path.join(root, ".venv", "bin", "python");
-
-if (!fs.existsSync(python)) {
-  console.error("Python venv not found at", python);
-  process.exit(1);
-}
+const root = resolveProjectRoot(import.meta.url);
+loadMonorepoEnv(root);
+const python = resolvePython(root);
+requirePythonVenv(python);
 
 const userId = process.argv[2]?.trim();
 const args = [path.join(root, "job_worker.py"), "--reevaluate-all"];
@@ -25,7 +24,7 @@ if (userId) {
   args.push(userId);
 }
 
-const result = spawnSync(python, args, { cwd: root, encoding: "utf8", shell: win });
+const result = spawnSync(python, ["-u", ...args], { cwd: root, encoding: "utf8", shell: isWin });
 if (result.stdout) process.stdout.write(result.stdout);
 if (result.stderr) process.stderr.write(result.stderr);
 

@@ -1,39 +1,21 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { killProcessTreeByPid, stopStaleNextDev } from "./stop-stale-next.mjs";
-import { loadMonorepoEnv, parseEnvFile } from "./load-env.mjs";
+import { resolveNextBin, resolveProjectRoot, webDevEnv } from "./run-utils.mjs";
 
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const root = resolveProjectRoot(import.meta.url);
 const webDir = path.join(root, "web");
-const win = process.platform === "win32";
-const nextBin = path.join(webDir, "node_modules", ".bin", win ? "next.cmd" : "next");
-
-if (!fs.existsSync(nextBin)) {
-  console.error("Web dependencies missing. Run: npm install --prefix web");
-  process.exit(1);
-}
+const nextBin = resolveNextBin(webDir);
 
 stopStaleNextDev();
-loadMonorepoEnv(root);
-
-const webLocal = {
-  ...parseEnvFile(path.join(webDir, ".env.local")),
-  ...parseEnvFile(path.join(webDir, ".env")),
-};
 
 const child = spawn(nextBin, ["dev", "--turbo", "-p", "3000"], {
   cwd: webDir,
   stdio: "inherit",
-  shell: win,
-  env: {
-    ...process.env,
-    ...webLocal,
-    PORT: "3000",
-    JOBTRACKER_ROOT: root,
-  },
+  shell: process.platform === "win32",
+  env: webDevEnv(root),
 });
 
 child.on("exit", (code, signal) => {

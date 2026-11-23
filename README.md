@@ -30,8 +30,9 @@ Open [http://localhost:3000](http://localhost:3000).
 
 | Command | Description |
 |---------|-------------|
-| `npm run search` | Next.js dev server + job worker |
-| `npm run dev` | Web app only |
+| `npm run search` | Next.js (Turbopack) + job worker; loads root `.env` |
+| `npm run dev` | Web app only (same env + Turbopack) |
+| `npm test` | Python + TS filter tests (Windows-safe) |
 | `npm run search:rescore` | Re-score all stored jobs (local scorer) |
 | `npm run search:once` | Process one queued search request |
 
